@@ -184,26 +184,40 @@ class _BaseAnalyst:
     def _call(self, prompt: str) -> dict:
         try:
             from zusik.clients.claude_client import ClaudeClient
-            if isinstance(self.client, ClaudeClient):
-                raw = self.client.message(
-                    prompt, max_tokens=800,
-                    use_web_search=self._use_web_search,
-                    tier=self._tier,
-                )
-            else:
-                # 레거시: anthropic.Anthropic 직접 사용
-                kwargs = {
-                    "model": self.model,
-                    "max_tokens": 800,        # 1200→800: 구조화 JSON 응답엔 충분, 토큰 절감
-                    "messages": [{"role": "user", "content": prompt}],
-                }
-                if self._use_web_search:
-                    kwargs["tools"] = [{"type": "web_search_20250305"}]
-                response = self.client.messages.create(**kwargs)
-                parts = [b.text for b in response.content if b.type == "text"]
-                raw = "\n".join(parts).strip()
 
-            return self._parse(raw)
+            def _do_call(p: str) -> str:
+                if isinstance(self.client, ClaudeClient):
+                    return self.client.message(
+                        p, max_tokens=800,
+                        use_web_search=self._use_web_search,
+                        tier=self._tier,
+                    )
+                else:
+                    kwargs = {
+                        "model": self.model,
+                        "max_tokens": 800,
+                        "messages": [{"role": "user", "content": p}],
+                    }
+                    if self._use_web_search:
+                        kwargs["tools"] = [{"type": "web_search_20250305"}]
+                    response = self.client.messages.create(**kwargs)
+                    parts = [b.text for b in response.content if b.type == "text"]
+                    return "\n".join(parts).strip()
+
+            raw = _do_call(prompt)
+            result = self._parse(raw)
+
+            # JSON 파싱 실패 시, 강화된 프롬프트로 1회 재시도
+            if result.get("reasoning", "") == "파싱 실패: { 없음":
+                retry_prompt = (
+                    "CRITICAL: You MUST respond with ONLY a JSON object. "
+                    "No markdown, no explanation, no code fences. Just the raw JSON.\n\n"
+                    + prompt
+                )
+                raw = _do_call(retry_prompt)
+                result = self._parse(raw)
+
+            return result
         except Exception as e:
             logger.warning("%s 분석 실패: %s", self.name_kr, e)
             return {"signal": "hold", "confidence": 0, "invest_ratio": 0,
