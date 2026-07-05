@@ -22,7 +22,7 @@
     "security_lock.py": "dad00e1685d321760929b274a5028477a3bd80fada87ff5e97480902a35206b5",
     "tests/test_bot.py": "57e5fd7052f9b1dfd4fb1fcf610c3e4fda14fbee8abf056e32bcef21d76e1553",
     "tests/test_claude_analyst_judge.py": "ada455e6f37c7d25c63d6b6b3278006c4418aefa3d1604e709c39a59e78ba0ac",
-    "tests/test_claude_analyst_parse.py": "2c719cded4c1cd85cd9d4e44b83ad3cb143507157b7afc924ddc91d9a4b1538d",
+    "tests/test_claude_analyst_parse.py": "a2faebbbba60abe1c16d978cae6bb3a554d4c5720241e616e6810d1678b28923",
     "tests/test_claude_analyst_support.py": "4f5f3db50e0c98340cc3da6c15515eda15426227faeefd39a001e7a249426637",
     "tests/test_claude_client_codex.py": "6c0246ad1a00f6abd1bd711885a3edd20486320e7ba9014a3faaae7c913c0195",
     "zusik/__init__.py": "2d94c17e334a900f4d8847cb9b9b672ac680dc5c3d9dfdd4d4ff5483d08ce54e",
