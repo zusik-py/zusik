@@ -89,8 +89,8 @@ class ZusikBot(discord.Client):
         self._alert_channel = None
 
     async def setup_hook(self):
-        await self.tree.sync()
-        logger.info("Discord 슬래시 명령 동기화 완료")
+        # 글로벌 sync 대신 on_ready에서 guild별 sync — 글로벌은 등록까지 최대 1시간 소요
+        pass
 
     async def on_ready(self):
         logger.info("Discord 봇 연결: %s", self.user.name)
@@ -103,17 +103,26 @@ class ZusikBot(discord.Client):
                     and ch.permissions_for(guild_me).send_messages:
                 self._alert_channel = ch
                 logger.info("알림 채널(지정): #%s", ch.name)
-                return
-            logger.warning("지정 알림 채널(id=%s)을 못 찾거나 권한 없음 — 자동 선택으로 폴백", pinned)
+            else:
+                logger.warning("지정 알림 채널(id=%s)을 못 찾거나 권한 없음 — 자동 선택으로 폴백", pinned)
+                pinned = None
         # 2) 폴백: 보낼 수 있는 첫 텍스트 채널 (기존 동작)
-        for guild in self.guilds:
-            for ch in guild.text_channels:
-                if ch.permissions_for(guild.me).send_messages:
-                    self._alert_channel = ch
-                    logger.info("알림 채널(자동): #%s", ch.name)
+        if not self._alert_channel:
+            for guild in self.guilds:
+                for ch in guild.text_channels:
+                    if ch.permissions_for(guild.me).send_messages:
+                        self._alert_channel = ch
+                        logger.info("알림 채널(자동): #%s", ch.name)
+                        break
+                if self._alert_channel:
                     break
-            if self._alert_channel:
-                break
+        # 3) 슬래시 명령 guild별 즉시 동기화 (글로벌 sync는 최대 1시간 소요)
+        for guild in self.guilds:
+            try:
+                await self.tree.sync(guild=guild)
+                logger.info("Discord 슬래시 명령 동기화 완료: %s", guild.name)
+            except Exception as e:
+                logger.warning("Discord 슬래시 명령 동기화 실패 (%s): %s", guild.name, e)
 
     async def _send_alert(self, message: str = "", embeds: list | None = None):
         """알림 채널로 메시지 전송."""

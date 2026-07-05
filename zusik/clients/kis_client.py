@@ -87,7 +87,7 @@ class KISClient:
             pass
 
         # 신규 발급
-        url = f"{self.base_url}/oauth2/tokenP"
+        url = f"{self.base_url}/oauth2/token"
         body = {
             "grant_type": "client_credentials",
             "appkey": self.app_key,
