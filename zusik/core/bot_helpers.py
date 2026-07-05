@@ -1262,6 +1262,10 @@ class CoreHelpersMixin:
 
     def _sync_equity_now(self):
         """실시간 자산 동기화."""
+        # KIS API가 필요 없는 crypto-only 모드면 skip — 403 noise 방지
+        if self.config.get("kr_enabled", True) is False \
+                and self.config.get("us_enabled", True) is False:
+            return
         try:
             from zusik.analysis.bot_money_helpers import compute_total_equity, compute_pnl_vs_deposit
             b = self.client.get_balance()

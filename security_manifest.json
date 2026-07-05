@@ -58,7 +58,7 @@
     "zusik/core/bot.py": "1ca541926e681894c81d885e5c7bdb1c07371213002d752cec141d522e2d48c2",
     "zusik/core/bot_aux.py": "751f5e58812a52279243d923f24c8d4a8987268fc78a933517c96893af3220c3",
     "zusik/core/bot_fastlane.py": "3f075758466e5a7381db36a1b3dc72fdef219dcb4ed9c3047d3de0a22e398e75",
-    "zusik/core/bot_helpers.py": "69fef219f3359ba908d5486d19370573b9ca5e18e9005a104d99ef8399b4690d",
+    "zusik/core/bot_helpers.py": "94f9cb0b9febd412f9bfab0d827c2a954e3927869eefb13956261c6638b41ea0",
     "zusik/core/bot_inverse.py": "b7a697c740855924d32b9c5d307c3a4cd114683fb4fdfde132aa37f9a6346974",
     "zusik/core/bot_kr.py": "d653f9753bea7f85546f365dabc18c1628f339a9f4a1c629aac07d521efa2cf5",
     "zusik/core/bot_reporting.py": "2d06efe76068cb8ac934d0361f05c059c64f6114af655010bb14a6341a7a15ae",
