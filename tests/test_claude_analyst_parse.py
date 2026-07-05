@@ -66,7 +66,7 @@ suffix
         result = self.mod._BaseAnalyst._parse(raw)
         self.assertEqual(result["signal"], "hold")
         self.assertEqual(result["confidence"], 0)
-        self.assertIn("{ 없음", result["reasoning"])
+        self.assertIn("regex", result["reasoning"])
 
     def test_parse_normalizes_null_numeric_fields_to_zero(self):
         #: LLM이 stop_loss/target_price/confidence를 null로 반환하면
