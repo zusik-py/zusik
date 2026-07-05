@@ -240,9 +240,8 @@ class _BaseAnalyst:
         # 첫 `{` 부터 균형 잡힌 `}` 까지만 추출 (Extra data 방지)
         start = text.find("{")
         if start == -1:
-            return {"signal": "hold", "confidence": 0, "invest_ratio": 0,
-                    "target_price": 0, "stop_loss": 0, "reasoning": "파싱 실패: { 없음",
-                    "long_term_reason": ""}
+            # JSON 없음 → plain text에서 regex로 핵심 필드 추출 시도
+            return _BaseAnalyst._parse_fallback(text)
 
         depth = 0
         end = -1
@@ -298,6 +297,35 @@ class _BaseAnalyst:
             if m:
                 result["reasoning"] = m.group(1)
             return result
+
+    @staticmethod
+    def _parse_fallback(text: str) -> dict:
+        """JSON `{`가 전혀 없는 plain-text 응답에서 regex로 핵심 필드 추출."""
+        import re
+        result = {"signal": "hold", "confidence": 0, "invest_ratio": 0,
+                  "target_price": 0, "stop_loss": 0,
+                  "reasoning": "regex 추출", "long_term_reason": ""}
+
+        # signal: buy / long_term_buy / sell / hold
+        m = re.search(r'(?:signal|판단|의견)[:\s]*(BUY|LONG_TERM_BUY|SELL|HOLD|buy|long_term_buy|sell|hold)', text, re.IGNORECASE)
+        if m:
+            result["signal"] = m.group(1).lower()
+        # confidence 백분율 또는 소수
+        m = re.search(r'(?:confidence|확신도|confidence level)[:\s]*(\d+(?:\.\d+)?)\s*%?', text, re.IGNORECASE)
+        if m:
+            val = float(m.group(1))
+            result["confidence"] = val / 100 if val > 1 else val
+        # invest_ratio / 투자비율
+        m = re.search(r'(?:invest[_\s]?ratio|투자비율|allocation)[:\s]*(\d+(?:\.\d+)?)\s*%?', text, re.IGNORECASE)
+        if m:
+            val = float(m.group(1))
+            result["invest_ratio"] = val / 100 if val > 1 else val
+        # reasoning: 첫 200자
+        m = re.search(r'(?:reasoning|reason|근거|이유|분석)[:\s]*(.{1,300})', text, re.IGNORECASE | re.DOTALL)
+        if m:
+            result["reasoning"] = m.group(1).strip()[:300]
+
+        return result
 
 
 class FundamentalAnalyst(_BaseAnalyst):
