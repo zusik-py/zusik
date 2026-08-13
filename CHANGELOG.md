@@ -2,6 +2,14 @@
 
 형식은 [Keep a Changelog](https://keepachangelog.com/ko/), 버전은 [SemVer](https://semver.org)를 따른다.
 
+## [1.0.6] - 2026-08-14
+
+### 호환성
+- `requirements.lock`을 개발 셸의 Python 3.13 전이 의존성으로 생성해 운영·Security CI의
+  Python 3.8에서 설치할 수 없던 문제를 수정했다. 락 생성기는 이제 프로젝트 운영 기준인
+  Python 3.8을 자동 탐색해 재실행하며, 사용할 수 없으면 비호환 락을 만들지 않고 중단한다.
+  Python 3.8 `importlib.metadata`가 `discord.py`를 누락하던 이름 정규화도 함께 보완했다.
+
 ## [1.0.5] - 2026-08-14
 
 ### 수익 구조

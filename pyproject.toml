@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zusik"
-version = "1.0.5"
+version = "1.0.6"
 description = "KIS(한국투자증권) 기반 AI 멀티-애널리스트 자동매매 봇 — KR/US/crypto, 수익 기반 자가학습"
 readme = "README.md"
 requires-python = ">=3.8"

@@ -18,7 +18,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
+import subprocess
 import sys
+from typing import Optional
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 MANIFEST = os.path.join(REPO, "security_manifest.json")
@@ -29,6 +32,45 @@ EXCLUDE_DIRS = {".git", "__pycache__", ".venv", "venv", "data", "logs",
                 ".claude", "node_modules", ".pytest_cache", ".mypy_cache"}
 TRACK_SUFFIX = (".py",)
 TRACK_NAMES = {"config.yaml"}
+LOCK_PYTHON = (3, 8)  # 운영·Security CI의 최소 지원 버전
+
+
+def _reexec_generate_with_lock_python() -> Optional[int]:
+    """락은 운영 기준 Python 3.8 환경에서만 생성한다.
+
+    개발 셸의 최신 Python(예: 3.13)로 설치된 전이 의존성을 그대로 고정하면
+    Python 3.8에서 설치할 수 없는 버전까지 lock에 들어간다. 사용 가능한 3.8을
+    자동 탐색해 전체 generate를 재실행하고, 없으면 잘못된 락을 만들지 않고 중단한다.
+    """
+    if sys.version_info[:2] == LOCK_PYTHON:
+        return None
+
+    candidates = [shutil.which("python3.8"), "/usr/bin/python3"]
+    current = os.path.realpath(sys.executable)
+    seen = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        candidate = os.path.realpath(candidate)
+        if candidate in seen or candidate == current or not os.path.isfile(candidate):
+            continue
+        seen.add(candidate)
+        try:
+            version = subprocess.check_output(
+                [candidate, "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+                text=True,
+                timeout=10,
+            ).strip()
+        except Exception:
+            continue
+        if version == "%d.%d" % LOCK_PYTHON:
+            print(f"의존성 락 호환성: {sys.version_info.major}.{sys.version_info.minor} 대신 "
+                  f"{candidate} (Python {version})로 재실행")
+            return subprocess.call([candidate, os.path.abspath(__file__), "generate"])
+
+    print("오류: requirements.lock은 운영 호환성을 위해 Python 3.8로 생성해야 합니다. "
+          "python3.8을 설치하거나 해당 인터프리터로 다시 실행하세요.", file=sys.stderr)
+    return 2
 
 
 def _iter_source_files():
@@ -132,7 +174,12 @@ def generate_lock():
             continue
         seen.add(key)
         try:
-            dist = im.distribution(nm)
+            try:
+                dist = im.distribution(nm)
+            except im.PackageNotFoundError:
+                # importlib.metadata(Python 3.8)는 ``discord.py`` dist-info를
+                # 점이 포함된 원명으로 못 찾고 canonical name(discord-py)만 인식한다.
+                dist = im.distribution(key)
             real = (dist.metadata["Name"] or nm).strip()
             ver = (dist.version or "").strip()
         except Exception:
@@ -197,6 +244,9 @@ def cmd_verify() -> int:
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "verify"
     if mode == "generate":
+        reexec_code = _reexec_generate_with_lock_python()
+        if reexec_code is not None:
+            sys.exit(reexec_code)
         cmd_generate()
     elif mode == "manifest":
         # 매니페스트만 갱신(네트워크 불필요) — pre-commit 훅 자동 갱신용.

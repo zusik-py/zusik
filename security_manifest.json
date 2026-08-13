@@ -19,7 +19,7 @@
     "scripts/sell_timing_review.py": "87c50be9b7aa93631469e0d027e64967d31440b39621f63abc608392e12370b2",
     "scripts/verify_profit.py": "285db7222cea620e3366b3e0215bd0848339dd1482c5c1b295b883db2f255025",
     "scripts/watchdog.py": "f2deedc58286f995f33ce231a24dab1885190f84dde73f074285c4c7efd5e601",
-    "security_lock.py": "dad00e1685d321760929b274a5028477a3bd80fada87ff5e97480902a35206b5",
+    "security_lock.py": "1abadd8ac1b81cc3c4cb610a15b918917ff88091a6066ae7e41f507cb6e05b02",
     "tests/test_bot.py": "498e7560602dbd8ab1c17988550ac3ada694d2a6bc5cc2dc4058cc38ebf51873",
     "tests/test_claude_analyst_judge.py": "55297c28cd02abf8df5d4e53c1affee71dfcecc81ddffa11600e77c7972c7f1c",
     "tests/test_claude_analyst_parse.py": "2c719cded4c1cd85cd9d4e44b83ad3cb143507157b7afc924ddc91d9a4b1538d",
