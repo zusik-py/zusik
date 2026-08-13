@@ -50,7 +50,7 @@ reports:
   # 이 날짜 이후 신규 매도만으로 조기손절 비중↓·실현↑ 효과를 매 장마감 자동 리포트.
   fix_baseline_date: "2026-06-03"
   pre_market_enabled: true    # 장전 리포트 — 매매 반영O: _pre_market_buy_gate가 sentiment로
-                              # 신규 매수 차단/확신도 하한 적용 (whitelist 우회). 복구.
+                              # 신규 매수 차단/확신도 하한 적용 (whitelist 포함). 복구.
   daily_enabled: false        # 장후 일일 리포트 — 매매 반영X (순수 Discord 보고용, 소비처 0).
                               # 무거운 LLM 호출이라 비활성 유지 (실투자 영향 없음).
   claude_screener_enabled: true   # AI 종목 선별 — 키 이름은 기존 설정 호환을 위해 유지.
@@ -71,7 +71,7 @@ arena:
 # 종목 선택 다양화/상황 적응 — RS 랭킹에 레짐·로테이션 틸트 적용.
 selection:
   regime_adaptive: true    # 하락장(bear score↑)엔 저변동(방어) 종목, 상승장엔 모멘텀 우선
-  min_relative_strength: -0.05  # 지수 대비 이 값보다 약하면 제외. 개인 공격 설정은 0.0 권장
+  min_relative_strength: 0.0  # 지수 대비 약한 신규 후보는 제외 (보유 종목 청산 관리는 계속)
   regime_bear_gate: 0.40   # bear score 이 이상이면 방어(저변동) 틸트 적용
   regime_vol_weight: 1.5   # 하락장 변동성 페널티 강도
   rotation: true           # 최근 매도 종목 디프리오리타이즈 — 같은 테마 쏠림 방지(로테이션)
@@ -168,9 +168,9 @@ adaptive:
       rsi_exit_profit_min: 0.05
 screening:
   enabled: true
-  # 종목 선택 방식 — monte_carlo(기본·MC 부트스트랩) | momentum(모멘텀) | trend(추세 정배열) | low_vol(저변동 방어).
+  # 종목 선택 방식 — momentum(기본) | monte_carlo(MC 부트스트랩) | trend(추세 정배열) | low_vol(저변동 방어).
   # MC 외 방식은 시뮬 없이 빨라 상황별로 골라 쓸 수 있다(예: 하락장 low_vol, 강세장 momentum).
-  method: monte_carlo
+  method: momentum
   # 강 분산 모드: 종목당 5~10% × 15+8 = 약 100% 활용.
   # 파생 ETF 제외 후 실제 종목 수 보전 위해 kr_count 여유롭게.
   kr_count: 15
@@ -178,7 +178,7 @@ screening:
   # auto_screener.filter_top에 전달 — 단일주 최소 N개 슬롯 보장 (ETF만 차지 방지)
   min_single_stocks_kr: 6
   min_single_stocks_us: 4
-  # whitelist: MC 점수와 무관하게 항상 후보에 포함 (사용자 핵심 종목)
+  # whitelist: 스크리닝 후보에는 포함하지만 가격·파생·상대강도·진입품질 게이트는 동일 적용
   # 분산 핵심 바스켓 (7섹터 8종목). 반도체 쏠림 해소 — 코어 진입이 각 섹터
   # 대표주를 하한만큼 담아 분산. (blacklist NAVER/카카오 제외)
   whitelist_kr:
@@ -204,7 +204,7 @@ screening:
   # 시장 변동을 따라가게. (현금 무관 재랭킹 — 고정 종목이 시장 흐름 무시하던 문제 해결.)
   auto_screen_interval_hours: 4
   crisis_interval_minutes: 30
-  style: defensive
+  style: balanced
   preferred_sectors:
   - 메가캡 반도체
   - 디펜시브 (통신/유틸리티/소비재)

@@ -1202,13 +1202,13 @@ class SelectionMixin:
         return False
 
     def _run_auto_screening(self):
-        """후보 풀 100+종 일일 스크리닝 — Vortex MC 8x 가속 활용.
+        """후보 풀 100+종 주기 스크리닝 — 로컬 가격 데이터로 재랭킹.
 
-        매일 1회 (자정 ~ 장 시작 전 사이) 호출:
+        설정된 시간 간격마다 호출:
           1. KR/US 후보 풀 OHLCV 병렬 fetch
-          2. 각 종목 MC 1만 path × 30일 → P(profit>0)/VaR95/추세 점수
-          3. 상위 N (KR 5종, US 5종) 자동 선정
-          4. self.kr_stocks / self.us_stocks 갱신 + 디스코드 알림
+          2. 설정된 방법(momentum/trend/low_vol/monte_carlo)으로 점수 계산
+          3. 상위 N과 whitelist를 후보로 구성
+          4. 동일한 상대강도 게이트를 거쳐 실제 감시 목록 갱신 + 디스코드 알림
         """
         #: 일 1회 → 시간 간격(auto_screen_interval_hours, 기본 4h)으로.
         # 감시종목이 하루종일 고정돼 시장 변동을 반영 못 하던 문제 — 이제 N시간마다 현재
@@ -1227,10 +1227,15 @@ class SelectionMixin:
             try:
                 from zusik.analysis.auto_screener import (AutoScreener, KR_CANDIDATE_POOL,
                                             US_CANDIDATE_POOL)
-                # Vortex 제거 — 종목 스크리닝은 numpy MC로 일원화.
                 runner = None
                 n_paths = 2000
-                logger.info("자동 스크리닝: numpy MC %d path", n_paths)
+                sel_method = str((self.config.get("screening", {}) or {}).get(
+                    "method", "momentum"
+                )).strip().lower()
+                if sel_method == "monte_carlo":
+                    logger.info("자동 스크리닝: numpy MC %d path", n_paths)
+                else:
+                    logger.info("자동 스크리닝: %s", sel_method)
 
                 screener = AutoScreener(kr_pick=5, us_pick=5)
 
@@ -1257,7 +1262,6 @@ class SelectionMixin:
 
                 import time as _t
                 t0 = _t.time()
-                sel_method = str((self.config.get("screening", {}) or {}).get("method", "monte_carlo"))
                 kr_scored = screener.screen_market(KR_CANDIDATE_POOL, _fetch_kr,
                                                    runner, n_paths=n_paths, method=sel_method)
                 us_scored = screener.screen_market(US_CANDIDATE_POOL, _fetch_us,
@@ -1322,7 +1326,9 @@ class SelectionMixin:
                     logger.info("  %s %s: %s", r["info"][0], r["info"][1],
                                 _screen_metric(r))
 
-                # watch list 갱신 — 파생ETF 권한 없으면 제거
+                # watch list 후보 구성 — whitelist도 강제 통과가 아닌 '후보'로만 추가한다.
+                # 최종 적용은 _apply_screened_stocks에서 가격/파생/상대강도 게이트를 공통 적용.
+                screened_result = {}
                 if kr_top:
                     kr_list = [{"code": r["info"][0], "name": r["info"][1]} for r in kr_top]
                     kr_list = self._filter_derivatives(kr_list, market="KR")
@@ -1333,7 +1339,7 @@ class SelectionMixin:
                         kr_list = [s for s in kr_list if s["code"] not in bl_kr]
                         if len(kr_list) < before:
                             logger.info("KR blacklist 제외: %s", ", ".join(bl_kr))
-                    # whitelist 강제 편입 — MC 점수 무관, 중복 dedup, blacklist 우선
+                    # whitelist 후보 편입 — 중복 제거·blacklist 우선. RS 미달이면 최종 제외.
                     wl = screen_cfg.get("whitelist_kr", []) or []
                     existing = {s["code"] for s in kr_list}
                     for w in wl:
@@ -1342,9 +1348,9 @@ class SelectionMixin:
                             kr_list.append({"code": code, "name": w.get("name", code)})
                             existing.add(code)
                     if wl:
-                        logger.info("KR whitelist 강제 편입 (%d종): %s",
+                        logger.info("KR whitelist 후보 편입 (%d종, RS 게이트 적용): %s",
                                     len(wl), ", ".join(w.get("name", w.get("code","")) for w in wl))
-                    self.kr_stocks = kr_list
+                    screened_result["kr"] = kr_list
                 if us_top:
                     us_list = [{"ticker": r["info"][0], "name": r["info"][1],
                                 "exchange": r["info"][2]} for r in us_top]
@@ -1358,9 +1364,12 @@ class SelectionMixin:
                                             "exchange": w.get("exchange", "NASD")})
                             existing_us.add(tk)
                     if wl_us:
-                        logger.info("US whitelist 강제 편입 (%d종): %s",
+                        logger.info("US whitelist 후보 편입 (%d종, RS 게이트 적용): %s",
                                     len(wl_us), ", ".join(w.get("name", w.get("ticker","")) for w in wl_us))
-                    self.us_stocks = us_list
+                    screened_result["us"] = us_list
+
+                if screened_result:
+                    self._apply_screened_stocks(screened_result, tag="자동 스크리닝")
 
                 # Discord 알림
                 if self.discord and (kr_top or us_top):

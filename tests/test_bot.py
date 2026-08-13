@@ -5320,6 +5320,54 @@ class RegimeSelectionTests(unittest.TestCase):
         b._apply_screened_stocks({"kr": self._stocks()}, tag="test")
         self.assertEqual(b.kr_stocks, [])
 
+    def test_auto_screening_routes_whitelist_candidates_through_common_gate(self):
+        """자동 선별이 목록을 직접 대입해 whitelist/RS 게이트를 우회하면 안 된다."""
+        import zusik.analysis.auto_screener as auto_module
+
+        b = self._bot(bear=0.10)
+        b.config["screening"] = {
+            "method": "momentum",
+            "auto_screen_interval_hours": 4,
+            "kr_count": 5,
+            "us_count": 5,
+            "whitelist_kr": [{"code": "WEAK", "name": "Weak Core"}],
+        }
+        b._last_auto_screen_ts = 0.0
+        b._filter_derivatives = lambda stocks, market: list(stocks)
+        b._apply_screened_stocks = Mock()
+        b.discord = None
+        b.client.get_balance.return_value = {"cash": 1_000_000, "total_eval": 1_000_000}
+        b.client.get_us_balance.return_value = {"cash_usd": 0, "holdings": []}
+
+        class _SyncThread:
+            def __init__(self, target, daemon=True):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        class _FakeScreener:
+            def __init__(self, **kwargs):
+                pass
+
+            def screen_market(self, candidates, *args, **kwargs):
+                return ([{"info": candidates[0], "score": 0.5,
+                          "method": "momentum"}] if candidates else [])
+
+            def filter_top(self, scored, *args, **kwargs):
+                return list(scored)
+
+        with patch.object(auto_module, "KR_CANDIDATE_POOL", [("STRONG", "Strong")]), \
+                patch.object(auto_module, "US_CANDIDATE_POOL", []), \
+                patch.object(auto_module, "AutoScreener", _FakeScreener), \
+                patch("threading.Thread", _SyncThread):
+            b._run_auto_screening()
+
+        b._apply_screened_stocks.assert_called_once()
+        result = b._apply_screened_stocks.call_args.args[0]
+        self.assertEqual([s["code"] for s in result["kr"]], ["STRONG", "WEAK"])
+        self.assertEqual(b._apply_screened_stocks.call_args.kwargs["tag"], "자동 스크리닝")
+
 
 class SelectionMethodTests(unittest.TestCase):
     """종목 선택 방식 플러그블 — MC 외 momentum/trend/low_vol 점수가 의도대로 정렬."""
@@ -5823,6 +5871,42 @@ class AiSignalIntegrationTests(unittest.TestCase):
             allow, reason = b._pre_market_buy_gate("KR", 0.95, symbol="005930")
         self.assertFalse(allow)
         self.assertIn("AI", reason)
+
+    def test_whitelist_does_not_bypass_daily_sell(self):
+        """관심종목도 종목별 매도 판단을 우회해 신규 진입하면 안 된다."""
+        b = self._stub()
+        b._is_whitelist = lambda symbol: symbol == "005930"
+        p = self._write("daily_ai_bias.json", {
+            "ts": self._now(), "kr": {"005930": "sell"}, "us": {},
+        })
+        mapping = {
+            "daily_ai_bias.json": p,
+            "cross_signals_kr.json": self._nope(),
+            "pre_market_sentiment_KR.json": self._nope("s"),
+        }
+        with self._redirect(mapping):
+            allow, reason = b._pre_market_buy_gate("KR", 0.95, symbol="005930")
+        self.assertFalse(allow)
+        self.assertIn("AI", reason)
+
+    def test_whitelist_does_not_bypass_market_risk_off(self):
+        """장전 신규매수 중단은 whitelist에도 동일하게 적용한다."""
+        b = self._stub()
+        b._is_whitelist = lambda symbol: symbol == "005930"
+        today = datetime.now().strftime("%Y-%m-%d")
+        sp = self._write("pre_market_sentiment_KR.json", {
+            "date": today, "stance": "risk_off", "avoid_new_buy": True,
+            "min_buy_confidence": 0.95, "neg_hits": 8,
+        })
+        mapping = {
+            "pre_market_sentiment_KR.json": sp,
+            "cross_signals_kr.json": self._nope(),
+            "daily_ai_bias.json": self._nope(),
+        }
+        with self._redirect(mapping):
+            allow, reason = b._pre_market_buy_gate("KR", 1.0, symbol="005930")
+        self.assertFalse(allow)
+        self.assertIn("신규 매수 차단", reason)
 
     def test_gate_bullish_relief_lowers_floor(self):
         b = self._stub()

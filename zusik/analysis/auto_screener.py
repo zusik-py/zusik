@@ -1,14 +1,13 @@
 from __future__ import annotations
-"""자동 스크리닝 — 후보 풀에서 MC 통계 + 추세 필터로 상위 종목 선정.
+"""자동 스크리닝 — 후보 풀에서 가격 기반 점수로 상위 종목 선정.
 
-매일 1회 (post_market 시점) 실행:
+설정된 주기마다 실행:
   1. 후보 풀 100+ 종목 OHLCV fetch (병렬)
-  2. 각 종목에 대해 Vortex MC 1만 path × 30일 시뮬
-  3. P(profit>0), VaR(95%), 추세 종합 점수 산출
-  4. 상위 N (KR 5종, US 5종) 자동 선정 → watch list 갱신
+  2. momentum/trend/low_vol 또는 numpy MC 점수 산출
+  3. 상위 N 자동 선정
+  4. 가격·파생·상대강도 공통 게이트 후 watch list 갱신
 
-Vortex 8x 가속이 100+ 종목 일괄 평가에 핵심 — 100종 × MC 80ms = 8초.
-numpy로는 100종 × 700ms = 70초.
+운영 기본값은 momentum이며, MC는 명시적으로 선택한 경우에만 실행한다.
 """
 
 import logging
@@ -20,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 # 후보 풀 (시드 10만원 호환 + 시총 큰 우량주 + 다양한 섹터 ETF)
 # KIS API에서 OHLCV 조회 가능한 종목.
-# Vortex 가속(8x) 활용 → 100+ 종목 일일 평가 가능.
+# 병렬 OHLCV 조회로 100+ 종목을 주기적으로 평가한다.
 KR_CANDIDATE_POOL = [
     # ══ 인덱스 ETF (시장 추종) ══
     ("102110", "TIGER 200"),

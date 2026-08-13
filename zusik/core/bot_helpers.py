@@ -1096,13 +1096,12 @@ class CoreHelpersMixin:
                              symbol: str = "") -> tuple[bool, str]:
         """장전 sentiment + AI 신호(크로스/데일리) 기반 신규 매수 허용 여부.
 
-        whitelist 종목은 sentiment 무관 통과 (사용자 명시 핵심 종목).
         (allow, reason) 반환. 같은 거래일 sentiment 파일이 없거나 오래됐으면 그 레이어는 중립.
         AI 신호는 symbol(종목)이 주어졌을 때만 적용 — 강세는 확신도 하한을 낮추고,
         약세는 하한을 올리거나(min_floor) 매도 판단이면 신규 매수를 차단한다(진입 게이트).
+        whitelist도 같은 게이트를 적용한다. 관심종목이라는 이유만으로 시장 위험회피나
+        종목별 매도 판단을 우회하면, 데이터 기반 선별을 거치지 않은 강제 진입이 된다.
         """
-        if symbol and self._is_whitelist(symbol):
-            return True, "whitelist 우회"
         import json as _json
         # ── 장전 sentiment 레이어 (없거나 stale이면 중립) ──
         avoid_new_buy = False
