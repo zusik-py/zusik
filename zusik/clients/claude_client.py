@@ -1,16 +1,17 @@
 from __future__ import annotations
-"""멀티 AI 클라이언트 — 용도별 모델 분배.
+"""멀티 AI 클라이언트 — Codex 우선, 다른 provider 자동 폴백.
 
 용도별 모델:
-  장전 종목 선정 / 장후 평가  → Claude Opus (최고급, 하루 5건)
-  중요 매매 판단              → Claude Sonnet (고급, 하루 10건)
-  실시간 퀀트/센티멘트        → agy / Codex / Haiku (저가, 하루 100+건)
+  모든 LLM 분석               → Codex 우선
+  Codex 한도/로그인/실패       → agy / Claude / 로컬 LLM 자동 폴백
 
 티어:
-  "premium"  → Claude Opus (종목 선정, 일일 리포트)
-  "hard"     → Claude Sonnet (매수/매도 최종 판단)
-  "medium"   → Codex / Haiku (펀더멘털 분석)
-  "easy"     → agy / Codex (퀀트, 센티멘트)
+  "premium"  → Codex / Claude Opus·Sonnet
+  "hard"     → Codex / Claude Sonnet·Haiku
+  "medium"   → Codex / agy / Haiku
+  "easy"     → Codex / agy / Haiku
+
+클래스명 ``ClaudeClient`` 는 기존 import 호환을 위해 유지한다.
 """
 
 import json
@@ -199,19 +200,6 @@ def _record_call(provider: str):
         pass
 
 
-# ── 라운드로빈 부하 분산 ──
-# easy/medium 티어에서 같은 사이클 내 여러 애널리스트가 동시에 호출될 때
-# 첫 번째 후보(agy 또는 codex)로 몰리는 걸 방지.
-# 모듈 전역 카운터로 매 호출마다 시작 인덱스를 회전.
-_TIER_ROTATION_IDX = {"easy": 0, "medium": 0, "hard": 0, "balanced": 0}
-
-
-def _next_rotation(tier: str) -> int:
-    cur = _TIER_ROTATION_IDX.get(tier, 0)
-    _TIER_ROTATION_IDX[tier] = cur + 1
-    return cur
-
-
 # ── LLM 가용성 추적 ──
 # message()가 단일 관문이라 여기서 실패/복구를 집계해 data/llm_health.json 에 영속화.
 # 봇(tick의 _check_llm_health)·외부 워치독·status 스냅샷이 공용으로 읽는다.
@@ -286,7 +274,11 @@ def _record_llm_health(degraded: bool, result: str) -> None:
 
 
 class ClaudeClient:
-    """용도별 AI 모델 분배."""
+    """Codex를 기본 provider로 쓰는 용도별 AI 모델 분배기.
+
+    ``provider`` 또는 ``ai_providers.primary_provider`` 로 주 provider를 바꿀 수 있다.
+    기존 ``auto`` 값은 저장소 기본값인 Codex를 뜻한다.
+    """
 
     def __init__(self, api_key: str = "", prefer_cli: bool = True, provider: str = "auto",
                  disable_codex: bool | None = None, disable_agy: bool | None = None):
@@ -294,6 +286,23 @@ class ClaudeClient:
         # config.yaml + config.local.yaml 병합본을 읽어 setup.sh 마법사/ configtool 설정이 먹게 한다.
         _cfg = _read_merged_cfg()
         ap = _cfg.get("ai_providers", {}) if isinstance(_cfg, dict) else {}
+        configured_primary = provider if provider != "auto" else (
+            ap.get("primary_provider") or _cfg.get("ai_provider") or "codex"
+        )
+        configured_primary = str(configured_primary).strip().lower()
+        if configured_primary not in ("codex", "agy", "claude"):
+            logger.warning("알 수 없는 primary provider(%s) — codex 사용", configured_primary)
+            configured_primary = "codex"
+        self._primary_provider = configured_primary
+        self._codex_model = str(ap.get("codex_model") or "gpt-5.6-sol").strip()
+        self._codex_effort = str(ap.get("codex_effort") or "low").strip().lower()
+        if self._codex_effort not in ("none", "low", "medium", "high", "xhigh", "max"):
+            logger.warning("알 수 없는 codex_effort(%s) — low 사용", self._codex_effort)
+            self._codex_effort = "low"
+        self._claude_effort = str(ap.get("claude_effort") or "low").strip().lower()
+        if self._claude_effort not in ("low", "medium", "high", "xhigh", "max"):
+            logger.warning("알 수 없는 claude_effort(%s) — low 사용", self._claude_effort)
+            self._claude_effort = "low"
         if disable_codex is None:
             disable_codex = bool(ap.get("disable_codex", False))
         if disable_agy is None:
@@ -333,12 +342,21 @@ class ClaudeClient:
                     self._has_local = False
 
         available = []
-        if self._has_agy: available.append("agy")
-        if self._has_codex: available.append("codex")
+        if self._has_codex:
+            available.append("codex(주)" if self._primary_provider == "codex" else "codex")
+        if self._has_agy:
+            available.append("agy(주)" if self._primary_provider == "agy" else "agy")
         if self._has_claude:
-            available.append("claude(일시정지)" if _claude_paused() else "claude(opus/sonnet/haiku)")
-        if self._has_local: available.append(f"local({self._local_model})")
-        logger.info("AI: %s", ", ".join(available) or "백엔드 없음")
+            if _claude_paused():
+                available.append("claude(일시정지)")
+            else:
+                label = "claude(주; opus/sonnet/haiku)" if self._primary_provider == "claude" \
+                    else "claude(opus/sonnet/haiku)"
+                available.append(label)
+        if self._has_local:
+            available.append(f"local({self._local_model})")
+        logger.info("AI(primary=%s): %s", self._primary_provider,
+                    ", ".join(available) or "백엔드 없음")
 
     @property
     def is_cli(self) -> bool:
@@ -349,10 +367,31 @@ class ClaudeClient:
 
     @property
     def provider_name(self) -> str:
-        if self._has_claude: return "claude"
-        if self._has_codex: return "codex"
-        if self._has_agy: return "agy"
+        primary = getattr(self, "_primary_provider", "codex")
+        if primary == "codex" and self._has_codex:
+            return "codex"
+        if primary == "agy" and self._has_agy:
+            return "agy"
+        if primary == "claude" and self._has_claude:
+            return "claude"
+        if self._has_codex:
+            return "codex"
+        if self._has_agy:
+            return "agy"
+        if self._has_claude:
+            return "claude"
         return "local"
+
+    def _prioritize_candidates(self, candidates: list) -> list:
+        """설정된 주 provider를 맨 앞에 두고 폴백 순서는 안정적으로 유지."""
+        primary = getattr(self, "_primary_provider", "codex")
+
+        def is_primary(item) -> bool:
+            name = item[0]
+            return name == primary or name.startswith(primary + "_")
+
+        return ([item for item in candidates if is_primary(item)] +
+                [item for item in candidates if not is_primary(item)])
 
     @staticmethod
     def _is_failed(result: str) -> bool:
@@ -422,7 +461,7 @@ class ClaudeClient:
     def _call_cheap_web(self, prompt: str, use_web_search: bool = False) -> str:
         """장전/장후 리포트용 저렴 tier(사용자 토큰 절감 요청).
 
-        agy/codex 우선 (사용자 별도 구독 — Claude 쿼터 미소모) + web_search 유지.
+        Codex 우선, agy 폴백 (Claude 쿼터 미소모) + web_search 유지.
         Claude는 두 CLI 모두 cooldown/한도 도달 시에만 haiku 폴백. sonnet/opus 완전 제외.
         로컬 LLM 활성 시 최우선(쿼터/비용 0).
         """
@@ -430,19 +469,15 @@ class ClaudeClient:
         if local is not None:
             return local
         candidates = []
-        if self._has_agy and _check_limit("agy"):
-            candidates.append(("agy", lambda: self._run_agy(prompt, use_web_search)))
         if self._has_codex and _check_limit("codex") and not self._is_codex_cooldown():
             candidates.append(("codex", lambda: self._run_codex(prompt, use_web_search)))
+        if self._has_agy and _check_limit("agy"):
+            candidates.append(("agy", lambda: self._run_agy(prompt, use_web_search)))
+        if self._has_claude and _check_limit("claude_haiku"):
+            candidates.append(("claude_haiku", lambda: self._run_claude(prompt, "haiku", False)))
         if not candidates:
-            # 셋 다 막혀야만 haiku (web_search 미지원, 텍스트만)
-            if self._has_claude and _check_limit("claude_haiku"):
-                candidates.append(("claude_haiku", lambda: self._run_claude(prompt, "haiku", False)))
-            if not candidates:
-                return '{"signal":"hold","confidence":0,"reasoning":"AI 한도 소진"}'
-        start = _next_rotation("cheap_web") % len(candidates)
-        ordered = candidates[start:] + candidates[:start]
-        for name, fn in ordered:
+            return '{"signal":"hold","confidence":0,"reasoning":"AI 한도 소진"}'
+        for name, fn in self._prioritize_candidates(candidates):
             result = fn()
             if not self._is_failed(result):
                 _record_call(name)
@@ -450,11 +485,8 @@ class ClaudeClient:
         return self._call_easy(prompt)
 
     def _call_balanced(self, prompt: str, use_web_search: bool = False) -> str:
-        """Claude/Codex/agy(Antigravity) 멀티 CLI 균등 분배.
+        """Codex 우선, Claude/agy(Antigravity) 자동 폴백.
 
-        사용자 의도: 셋 다 구독중이라 "한쪽 몰림" 방지하며 모두 활용.
-        모듈 카운터 _next_rotation('balanced')로 시작 인덱스를 매 호출 회전 →
-        동시 호출자가 4명이어도 1명씩 다른 CLI로 시작.
         cooldown/한도 도달 CLI는 후보에서 자동 제외.
         모두 실패 시 haiku 폴백.
         로컬 LLM 활성 시 최우선(쿼터/비용 0).
@@ -463,11 +495,6 @@ class ClaudeClient:
         if local is not None:
             return local
         candidates = []
-        if self._has_claude and _check_limit("claude_sonnet"):
-            candidates.append((
-                "claude_sonnet",
-                lambda: self._run_claude(prompt, "sonnet", use_web_search),
-            ))
         if self._has_codex and _check_limit("codex") and not self._is_codex_cooldown():
             candidates.append((
                 "codex",
@@ -478,14 +505,17 @@ class ClaudeClient:
                 "agy",
                 lambda: self._run_agy(prompt, use_web_search),
             ))
+        if self._has_claude and _check_limit("claude_sonnet"):
+            candidates.append((
+                "claude_sonnet",
+                lambda: self._run_claude(prompt, "sonnet", use_web_search),
+            ))
 
         if not candidates:
             # 전부 막혔으면 haiku로 빠짐
             return self._call_easy(prompt)
 
-        start = _next_rotation("balanced") % len(candidates)
-        ordered = candidates[start:] + candidates[:start]
-        for name, fn in ordered:
+        for name, fn in self._prioritize_candidates(candidates):
             result = fn()
             if not self._is_failed(result):
                 _record_call(name)
@@ -494,16 +524,26 @@ class ClaudeClient:
         return self._call_easy(prompt)
 
     def _call_premium(self, prompt: str, use_web_search: bool) -> str:
-        """장전 종목 선정 / 장후 리포트 → Claude Opus → Sonnet → hard tier."""
+        """장전 종목 선정 / 장후 리포트 → Codex 우선, Claude 고급 모델 폴백."""
+        candidates = []
+        if self._has_codex and _check_limit("codex") and not self._is_codex_cooldown():
+            candidates.append(("codex", lambda: self._run_codex(prompt, use_web_search)))
         if self._has_claude and _check_limit("claude_opus"):
-            result = self._run_claude(prompt, "opus", use_web_search)
-            if not self._is_failed(result):
-                _record_call("claude_opus")
-                return result
+            candidates.append((
+                "claude_opus",
+                lambda: self._run_claude(prompt, "opus", use_web_search),
+            ))
         if self._has_claude and _check_limit("claude_sonnet"):
-            result = self._run_claude(prompt, "sonnet", use_web_search)
+            candidates.append((
+                "claude_sonnet",
+                lambda: self._run_claude(prompt, "sonnet", use_web_search),
+            ))
+        if self._has_agy and _check_limit("agy"):
+            candidates.append(("agy", lambda: self._run_agy(prompt, use_web_search)))
+        for name, fn in self._prioritize_candidates(candidates):
+            result = fn()
             if not self._is_failed(result):
-                _record_call("claude_sonnet")
+                _record_call(name)
                 return result
         local = self._try_local(prompt, use_web_search)
         if local is not None:
@@ -511,16 +551,26 @@ class ClaudeClient:
         return self._call_hard(prompt, use_web_search)
 
     def _call_hard(self, prompt: str, use_web_search: bool) -> str:
-        """중요 매매 판단 → Sonnet → Haiku → medium tier."""
+        """중요 매매 판단 → Codex 우선, Claude/agy 폴백."""
+        candidates = []
+        if self._has_codex and _check_limit("codex") and not self._is_codex_cooldown():
+            candidates.append(("codex", lambda: self._run_codex(prompt, use_web_search)))
         if self._has_claude and _check_limit("claude_sonnet"):
-            result = self._run_claude(prompt, "sonnet", use_web_search)
-            if not self._is_failed(result):
-                _record_call("claude_sonnet")
-                return result
+            candidates.append((
+                "claude_sonnet",
+                lambda: self._run_claude(prompt, "sonnet", use_web_search),
+            ))
+        if self._has_agy and _check_limit("agy"):
+            candidates.append(("agy", lambda: self._run_agy(prompt, use_web_search)))
         if self._has_claude and _check_limit("claude_haiku"):
-            result = self._run_claude(prompt, "haiku", False)
+            candidates.append((
+                "claude_haiku",
+                lambda: self._run_claude(prompt, "haiku", False),
+            ))
+        for name, fn in self._prioritize_candidates(candidates):
+            result = fn()
             if not self._is_failed(result):
-                _record_call("claude_haiku")
+                _record_call(name)
                 return result
         local = self._try_local(prompt, use_web_search)
         if local is not None:
@@ -528,10 +578,9 @@ class ClaudeClient:
         return self._call_medium(prompt)
 
     def _call_medium(self, prompt: str) -> str:
-        """퀀트/펀더멘털 보조 — Codex/agy/Haiku 라운드로빈.
+        """퀀트/펀더멘털 보조 — Codex 우선 + agy/Haiku 폴백.
 
-        같은 사이클 동시 호출 분산을 위해 라운드로빈 도입.
-        codex 첫 → 다음 호출 haiku 첫 → 다음 codex … 순서로 회전.
+        Codex가 가용하면 항상 먼저 사용한다.
         로컬 LLM 활성 시 최우선(쿼터/비용 0).
         """
         local = self._try_local(prompt, False)
@@ -547,9 +596,7 @@ class ClaudeClient:
         if not candidates:
             return self._call_easy(prompt)
 
-        start = _next_rotation("medium") % len(candidates)
-        ordered = candidates[start:] + candidates[:start]
-        for name, fn in ordered:
+        for name, fn in self._prioritize_candidates(candidates):
             result = fn()
             if not self._is_failed(result):
                 _record_call(name)
@@ -557,9 +604,8 @@ class ClaudeClient:
         return self._call_easy(prompt)
 
     def _call_easy(self, prompt: str) -> str:
-        """센티멘트/일반 — agy/Codex 라운드로빈 + Haiku 최종 폴백.
+        """센티멘트/일반 — Codex 우선 + agy/Haiku 폴백.
 
-        첫 후보에 몰리던 부하를 라운드로빈으로 분산.
         cooldown/한도 도달 CLI는 candidates에서 자동 제외.
         로컬 LLM 활성 시 최우선(쿼터/비용 0).
         """
@@ -567,19 +613,17 @@ class ClaudeClient:
         if local is not None:
             return local
         candidates = []
-        if self._has_agy and _check_limit("agy"):
-            candidates.append(("agy", lambda: self._run_agy(prompt)))
         if self._has_codex and _check_limit("codex") and not self._is_codex_cooldown():
             candidates.append(("codex", lambda: self._run_codex(prompt)))
+        if self._has_agy and _check_limit("agy"):
+            candidates.append(("agy", lambda: self._run_agy(prompt)))
         if self._has_claude and _check_limit("claude_haiku"):
             candidates.append(("claude_haiku", lambda: self._run_claude(prompt, "haiku", False)))
 
         if not candidates:
             return '{"signal":"hold","confidence":0,"reasoning":"AI 한도 소진"}'
 
-        start = _next_rotation("easy") % len(candidates)
-        ordered = candidates[start:] + candidates[:start]
-        for name, fn in ordered:
+        for name, fn in self._prioritize_candidates(candidates):
             result = fn()
             if not self._is_failed(result):
                 _record_call(name)
@@ -588,38 +632,48 @@ class ClaudeClient:
 
     # ── CLI 호출 ──
 
-    # alias → 200k context 풀 모델명 매핑.
-    # 'opus' alias는 사용자 환경에 따라 'claude-opus-4-7[1m]'으로 해석돼
-    # "Usage credits required for 1M context" 오류를 일으킬 수 있음 → 200k 버전 명시.
-    # sonnet: Sonnet 5 (claude-sonnet-5, 라이브 검증 2026-07-01). 날짜 접미사 ID는 미존재.
+    # Claude Code 공식 최신 별칭. 역할만 고정하고 실제 최신 모델은 설치된 CLI가 해석한다.
+    # 특정 버전 ID를 박아두면 새 CLI에서 폐기된 모델을 계속 호출하는 문제가 생긴다.
     _MODEL_FULL = {
-        "opus":   "claude-opus-4-7",
-        "sonnet": "claude-sonnet-5",
-        "haiku":  "claude-haiku-4-5-20251001",
+        "opus": "opus",
+        "sonnet": "sonnet",
+        "haiku": "haiku",
     }
 
     def _run_claude(self, prompt: str, model: str, use_web_search: bool) -> str:
-        # 비대화형 봇 호출이라 권한 프롬프트가 뜨면 hang됨.
-        # bypassPermissions + WebSearch/WebFetch 명시 허용으로 무인 자동 승인.
         full_model = self._MODEL_FULL.get(model, model)
-        # bypassPermissions 로 무인 승인하되, 로컬 파일/셸 도구는 --disallowedTools 로 차단.
-        # 분석은 텍스트(+선택적 웹검색)만 필요하므로 Bash/Read/Write 등은 줄 이유가 없다.
+        effort = getattr(self, "_claude_effort", "low")
+        # 최신 Claude Code의 print/text 계약을 명시하고 세션·프로젝트 커스터마이징을 격리한다.
+        # 도구 자체도 검색 2개 또는 0개로 축소해 bypass 모드에서 로컬 작업이 불가능하다.
         cmd = ["claude", "-p", prompt, "--model", full_model,
+               "--effort", effort, "--output-format", "text",
+               "--no-session-persistence", "--safe-mode",
                "--permission-mode", "bypassPermissions",
                "--disallowedTools", _CLAUDE_DISALLOWED_TOOLS]
         if use_web_search:
-            cmd.extend(["--allowedTools", "WebSearch,WebFetch"])
+            cmd.extend(["--tools", "WebSearch,WebFetch",
+                        "--allowedTools", "WebSearch,WebFetch"])
+        else:
+            cmd.extend(["--tools", ""])
         return self._exec(cmd, f"claude_{model}", timeout=300 if use_web_search else 150)
 
     def _run_codex(self, prompt: str, use_web_search: bool = False) -> str:
-        # codex exec는 별도 --search 플래그가 없어 -c features.web_search=true로 활성화.
-        # interactive `codex --search`와 동일한 native Responses web_search tool 노출.
-        cmd = ["codex", "exec", "--full-auto", "--skip-git-repo-check",
-               "-o", "/dev/stdout"]
-        if use_web_search:
-            cmd.extend(["-c", "features.web_search=true"])
-        cmd.append(prompt)
-        return self._exec(cmd, "codex", timeout=300 if use_web_search else 150)
+        # 투자 분석용 Codex에는 저장소 쓰기 권한이 필요 없다. 빈 임시 작업 디렉터리 + read-only
+        # sandbox + ephemeral 세션으로 실행해 외부 뉴스/종목명 프롬프트 인젝션이 소스·설정을
+        # 수정하거나 저장소 AGENTS.md 지침을 분석 응답에 섞는 경로를 차단한다.
+        with tempfile.TemporaryDirectory(prefix="zusik-codex-analysis-") as workdir:
+            cmd = ["codex", "exec", "--sandbox", "read-only", "--ephemeral",
+                   "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check",
+                   "--color", "never", "-C", workdir]
+            model = getattr(self, "_codex_model", "gpt-5.6-sol")
+            if model:
+                cmd.extend(["--model", model])
+            effort = getattr(self, "_codex_effort", "low")
+            cmd.extend(["-c", f"model_reasoning_effort={effort}"])
+            if use_web_search:
+                cmd.extend(["-c", "features.web_search=true"])
+            cmd.append(prompt)
+            return self._exec(cmd, "codex", timeout=300 if use_web_search else 150)
 
     def _run_agy(self, prompt: str, use_web_search: bool = False) -> str:
         """Antigravity(agy) CLI — 구글 Gemini 계열 provider.
@@ -648,7 +702,8 @@ class ClaudeClient:
     )
 
     def _is_codex_cooldown(self) -> bool:
-        import os, time
+        import os
+        import time
         try:
             if os.path.exists(self._CODEX_COOLDOWN_FILE):
                 with open(self._CODEX_COOLDOWN_FILE) as f:
@@ -694,7 +749,8 @@ class ClaudeClient:
                     if not self._is_codex_cooldown():  # 진입 시 1회만 시끄럽게
                         logger.error(
                             "codex 세션 만료 — 'codex login' 재실행 필요. "
-                            "15분간 codex 건너뛰고 claude로 분석 진행 (재로그인하면 자동 복구).")
+                            "15분간 codex 건너뛰고 다른 provider로 분석 진행 "
+                            "(재로그인하면 자동 복구).")
                     self._set_codex_cooldown(15.0)
                     return '{"signal":"hold","confidence":0,"reasoning":"codex 세션 만료(로그인 필요)"}'
                 # codex 사용량 한도(쿼터) 소진 — 세션 살아있고 한도 리셋되면 복귀.
@@ -703,7 +759,8 @@ class ClaudeClient:
                     if not self._is_codex_cooldown():
                         logger.error(
                             "codex 사용량 한도 도달 — 한도 리셋/크레딧 충전 필요. "
-                            "60분간 codex 건너뛰고 claude로 진행 (한도 회복 시 자동 복구).")
+                            "60분간 codex 건너뛰고 다른 provider로 진행 "
+                            "(한도 회복 시 자동 복구).")
                     self._set_codex_cooldown(60.0)
                     return '{"signal":"hold","confidence":0,"reasoning":"codex 사용량 한도"}'
                 if output:

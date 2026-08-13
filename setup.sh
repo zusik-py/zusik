@@ -294,26 +294,15 @@ EOF
   info "${C_B}.env 설정 완료${C_0} (권한 600 자동 설정). 값을 바꾸려면 ${C_B}./setup.sh --config${C_0} 다시 실행 — 파일 직접 편집 불필요."
 }
 
-# ── AI CLI 설치 점검 (claude · codex · antigravity[agy]) ──
-# 봇은 설치된 CLI 로 분석을 분산한다(claude/codex/agy). 없으면 설치 여부를 묻고 설치한다.
+# ── AI CLI 설치 점검 (codex 주 · claude/antigravity 폴백) ──
+# 봇은 Codex를 먼저 쓰고 한도/로그인/실패 때 설치된 다른 CLI로 폴백한다.
 # set -e 대비: 모든 설치 명령은 || warn 로 가드(실패해도 스크립트 중단 안 함).
 setup_ai_clis() {
   [ -t 0 ] || return 0   # 비대화형 셸이면 자동 설치 생략
-  step "AI CLI 점검 (claude · codex · antigravity[agy])"
-  info "봇은 설치된 CLI(claude/codex/agy)로 분석을 분산합니다 — 많을수록 쿼터 분산이 좋아집니다."
+  step "AI CLI 점검 (codex 주 · claude/antigravity 폴백)"
+  info "봇은 Codex를 기본으로 사용하고, 사용할 수 없을 때 다른 CLI로 자동 폴백합니다."
 
-  # 1) claude (Claude Code) — 네이티브 설치 스크립트
-  if command -v claude >/dev/null 2>&1; then
-    info "claude — 이미 설치됨"
-  elif ask_yn "claude CLI 가 없습니다. 설치할까요? (Y/n)" "Y"; then
-    info "설치 중: curl -fsSL https://claude.ai/install.sh | bash"
-    curl -fsSL https://claude.ai/install.sh | bash || warn "claude 설치 실패 — 수동: https://docs.claude.com/claude-code (또는 npm i -g @anthropic-ai/claude-code)"
-    if command -v claude >/dev/null 2>&1; then info "claude 설치 완료 — 최초 1회 로그인: ${C_B}claude${C_0}"; fi
-  else
-    warn "claude 건너뜀 (나중에 ./setup.sh 재실행으로 설치 가능)"
-  fi
-
-  # 2) codex (OpenAI Codex CLI) — npm 전역 설치
+  # 1) codex (OpenAI Codex CLI) — 기본 provider
   if command -v codex >/dev/null 2>&1; then
     info "codex — 이미 설치됨"
   elif ask_yn "codex CLI 가 없습니다. 설치할까요? (npm 필요) (Y/n)" "Y"; then
@@ -326,6 +315,17 @@ setup_ai_clis() {
     fi
   else
     warn "codex 건너뜀"
+  fi
+
+  # 2) claude (Claude Code) — 선택 폴백
+  if command -v claude >/dev/null 2>&1; then
+    info "claude — 이미 설치됨 (폴백)"
+  elif ask_yn "Claude CLI를 폴백으로도 설치할까요? (y/N)" "N"; then
+    info "설치 중: curl -fsSL https://claude.ai/install.sh | bash"
+    curl -fsSL https://claude.ai/install.sh | bash || warn "claude 설치 실패 — 수동: https://docs.claude.com/claude-code (또는 npm i -g @anthropic-ai/claude-code)"
+    if command -v claude >/dev/null 2>&1; then info "claude 설치 완료 — 최초 1회 로그인: ${C_B}claude${C_0}"; fi
+  else
+    info "claude 폴백 건너뜀"
   fi
 
   # 3) antigravity(agy) — 구글 Gemini 계열 provider. 네이티브 설치 스크립트(npm 아님).
@@ -343,11 +343,11 @@ setup_ai_clis() {
 
   # 요약 (set -e 대비 if 사용)
   local have=""
-  for c in claude codex agy; do
+  for c in codex agy claude; do
     if command -v "$c" >/dev/null 2>&1; then have="$have $c"; fi
   done
   if [ -n "$have" ]; then info "사용 가능 AI CLI:${have}"
-  else warn "AI CLI 없음 — 로컬 LLM(아래) 또는 .env 의 ANTHROPIC_API_KEY 로 분석을 켜세요."; fi
+  else warn "AI CLI 없음 — 로컬 LLM(아래)을 켜거나 Codex CLI를 설치하세요."; fi
 
   # agy 로그인 영속화 — Secret Service 데몬이 없으면(WSL/헤드리스) 토큰이 안 남아 매번 재로그인.
   # gnome-keyring 등 키링이 있으면(데스크톱) 이 블록은 건너뜀. (busctl=systemd/Linux 전용)
@@ -365,7 +365,7 @@ setup_ai_clis() {
 }
 
 # ── AI 요금제/개수별 호출 한도 (선택) ──
-# 사람마다 claude/codex/agy 요금제와 보유 개수가 달라 하루 LLM 호출 한도를 다르게 잡아야 한다.
+# Codex를 주로 쓰되, 사람마다 codex/claude/agy 요금제와 보유 개수가 달라 한도를 다르게 잡는다.
 # 설치된 CLI 를 보고 요금제를 물어 config.local.yaml 에 api_cost.daily_limits + ai_providers.disable_*
 # 를 쓴다(configtool.py). 안 쓰는 provider 는 한도 0 + disable 로 막아 쿼터/요금을 보호한다.
 setup_ai_plans() {
@@ -377,7 +377,7 @@ setup_ai_plans() {
     || command -v agy >/dev/null 2>&1 || return 0
 
   step "AI 요금제/개수별 호출 한도 (선택)"
-  info "요금제·개수에 맞춰 하루 LLM 호출 한도를 잡습니다. 안 쓰는 provider 는 막아 쿼터를 보호합니다."
+  info "Codex 주 사용량과 폴백 provider 한도를 요금제에 맞춥니다. 안 쓰는 provider는 차단합니다."
   info "모르면 기본값(권장)으로 두세요 — 나중에 ${C_B}python scripts/configtool.py${C_0} 로 바꿀 수 있습니다."
   ask_yn "지금 AI 요금제에 맞춰 한도를 설정할까요? (Y/n)" "Y" || { info "기본 한도 유지 (config.yaml)"; return 0; }
 

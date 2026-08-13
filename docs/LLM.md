@@ -1,6 +1,6 @@
 # LLM 분석 계약과 가중치 하네스
 
-이 문서는 봇이 투자 판단에 LLM을 어떻게 쓰는지 정리한다. 어떤 provider(claude, codex, agy)를
+이 문서는 봇이 투자 판단에 LLM을 어떻게 쓰는지 정리한다. 어떤 provider(codex, agy, claude)를
 쓰든 같은 형식으로 답하게 만들고, 그 답을 매매 가중치에 일관되게 반영하는 것이 목표다.
 
 ## 왜 계약이 필요한가
@@ -99,7 +99,14 @@ qty       = positions.plan_buy(...)   # 분할 매수 계획으로 수량 환산
 ## provider 일관성 정리
 
 - 출력 형식: `ANALYST_RESPONSE_FORMAT` 하나로 통일. provider가 달라도 같은 JSON.
-- 한도·분산: provider별 하루 호출 한도(`api_cost.daily_limits`)와 라운드로빈으로 한쪽 쏠림을 막는다.
-- 폴백: 한 provider가 한도/실패면 다음으로 넘어가고, 다 막히면 로컬 퀀트로 매매를 유지한다.
-- 비용: 저가 티어는 codex·agy를, 중요한 판단은 Claude를 우선 쓴다. 로컬 LLM(Ollama)을 켜면
-  저가 티어를 로컬로 돌릴 수 있다(`docs/LOCAL_LLM.md`).
+- 주 provider: `ai_providers.primary_provider: codex`가 기본이다. `premium`, `hard`, `balanced`,
+  `medium`, `easy`, `cheap_web` 모두 Codex를 먼저 호출한다.
+- 모델 계약: Codex는 `gpt-5.6-sol`·`low` reasoning을 기본으로 명시하고, Claude 폴백은 CLI의
+  최신 역할 별칭 `opus`/`sonnet`/`haiku`를 사용한다. Claude 호출은 `--safe-mode`·비영속 text
+  출력으로 격리한다.
+- 폴백: Codex가 한도·로그인·응답 문제로 실패하면 agy/Claude로 넘어가고, 모두 막히면 로컬 퀀트로
+  매매를 유지한다. 기존 `ClaudeClient`·`ClaudeAnalyst` 이름은 저장 데이터와 import 호환을 위해 유지한다.
+- 권한 격리: Codex는 빈 임시 작업 디렉터리에서 읽기 전용 sandbox와 ephemeral 세션으로 실행한다.
+  투자 분석이 소스나 설정을 바꿀 수 없다.
+- 로컬 우선: `local_enabled: true`를 명시한 사용자는 저렴 티어를 로컬 LLM으로 돌릴 수 있다
+  (`docs/LOCAL_LLM.md`).

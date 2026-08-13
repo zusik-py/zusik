@@ -238,11 +238,15 @@ python3 calibrate_from_history.py --days 900
 
 ## 9. AI 사용량 & 비용
 
-LLM 호출 비용을 세 가지 축으로 조절합니다. provider 분산, 웹검색 범위, 일일 한도입니다.
+LLM 호출 비용을 세 가지 축으로 조절합니다. 주 provider와 폴백, 웹검색 범위, 일일 한도입니다.
 
 ```yaml
 ai_providers:
-  disable_codex: false           # claude/codex/agy 멀티 CLI 분산. 한 CLI 한도/실패 시 자동 폴백·cooldown
+  primary_provider: codex        # 모든 LLM 티어의 기본. codex | agy | claude
+  disable_codex: false           # false여야 기본 Codex 라우팅 활성
+  codex_model: gpt-5.6-sol       # 최신 품질 우선 모델
+  codex_effort: low              # 지연·사용량과 판단 품질의 균형
+  claude_effort: low             # 자동 분석 지연·쿼터 절감
   disable_agy: false             # agy(Antigravity): 구글 Gemini 계열 provider
 strategy:
   name: auto_hybrid              # 변동성 기반 자동 전환 (adaptive ↔ claude quick/full)
@@ -267,12 +271,12 @@ api_cost:
 analysis_max_workers: 3          # 분석 병렬 워커 수
 ```
 
-> 비용을 더 줄이려면 `daily_limits` 를 saver 프리셋으로 낮추고, 웹검색을 full 분석에만 적용하며,
-> `disable_codex: false` 로 3-CLI 분산을 유지하세요. 한 CLI 의 쿼터 부담을 나눌 수 있습니다.
+> 비용을 더 줄이려면 `daily_limits`를 saver 프리셋으로 낮추고 웹검색을 full 분석에만 적용하세요.
+> `primary_provider: codex`와 `disable_codex: false`가 기본입니다. Codex가 막힐 때만 다른 provider를 씁니다.
 
 ### 9.1 요금제·개수에 맞춘 자동 설정 (권장)
 
-사람마다 claude/codex/agy 의 **요금제와 보유 개수**가 다릅니다. 최고 요금제를 다 쓰는 사람도,
+사람마다 codex/claude/agy 의 **요금제와 보유 개수**가 다릅니다. 최고 요금제를 다 쓰는 사람도,
 하나만 가볍게 쓰는 사람도 있죠. `./setup.sh` (또는 `./setup.sh --config`) 의 **AI 요금제 마법사**가
 설치된 CLI 를 감지해 요금제를 묻고, 그에 맞는 `api_cost.daily_limits` 와 `ai_providers.disable_*` 를
 `config.local.yaml` 에 자동으로 써 줍니다. 안 쓰는 provider 는 한도 0 + `disable` 로 막아 쿼터/요금을
@@ -292,7 +296,8 @@ analysis_max_workers: 3          # 분석 병렬 워커 수
 **보수적인 하루 호출 횟수 상한**이며, 한도에 닿으면 다른 provider 로 자동 폴백해 매매는 끊기지 않습니다.
 
 ```bash
-# 마법사 없이 직접 설정하는 예 (Claude Pro + Codex Plus 만 쓰는 경우)
+# 마법사 없이 직접 설정하는 예 (Codex Plus 주 + Claude Pro 폴백)
+python scripts/configtool.py set ai_providers.primary_provider codex
 python scripts/configtool.py set api_cost.daily_limits.claude_opus 0
 python scripts/configtool.py set api_cost.daily_limits.claude_sonnet 80
 python scripts/configtool.py set api_cost.daily_limits.claude_haiku 300
@@ -308,7 +313,7 @@ python scripts/configtool.py show                                   # 확인
 ### 9.2 로컬 LLM (API 비용/쿼터 없음)
 
 API 대형 LLM 대신 자기 머신의 로컬 모델(Ollama)로 분석을 돌리고 싶다면 켭니다. **기본 OFF**이며,
-CLI/API 구독자는 건드릴 필요가 없습니다. 켜면 저렴 티어는 로컬 우선, 중요 판단은 Claude 우선으로
+CLI/API 구독자는 건드릴 필요가 없습니다. 켜면 저렴 티어는 로컬 우선, 중요 판단은 Codex 우선으로
 동작하며 로컬로 폴백합니다. 검색 백엔드 결과를 프롬프트에 주입해 검색 기능도 활용할 수 있습니다.
 
 ```yaml

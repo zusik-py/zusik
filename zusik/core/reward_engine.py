@@ -20,6 +20,15 @@ logger = logging.getLogger(__name__)
 
 REWARD_FILE = os.path.join("data", "reward_state.json")
 
+# 2026-08 실거래에서 청산 사유를 진입 컨텍스트로 저장해
+# peace:long:rsi_overbought 37건/36승이 "과매수 매수 승률 97.3%"로 프롬프트에
+# 유출됐다. 이 라벨들은 진입 품질이 아니라 출구 품질이므로 자본 배분/매수 프롬프트에서 제외한다.
+EXIT_ONLY_CONTEXT_SUFFIXES = {
+    "rsi_overbought", "split_profit", "breakeven_protect", "trailing_stop",
+    "forced_stop", "slow_bleed", "crash_instant", "quick_loss", "rotate",
+    "ambiguous_take", "inverse_take", "inverse_eod_lock",
+}
+
 
 def _load() -> dict:
     if os.path.exists(REWARD_FILE):
@@ -206,6 +215,10 @@ class RewardEngine:
         if not context:
             return 1.0
 
+        # 구 reward_state에 남은 청산 라벨은 진입 배수로 재사용하지 않는다.
+        if context.rsplit(":", 1)[-1] in EXIT_ONLY_CONTEXT_SUFFIXES:
+            return 1.0
+
         ctx = self._get_context_score(context)
         if ctx["trades"] < self.context_learning_trades:
             return 1.0
@@ -244,6 +257,7 @@ class RewardEngine:
             "bb_position": _bb_position(indicators),
             "volatility": indicators.get("20일_변동성"),
             "signal": signal,
+            "source": "entry",
             "realized_rate": realized_rate,
             "date": datetime.now().strftime("%Y-%m-%d"),
         }
@@ -262,14 +276,18 @@ class RewardEngine:
                 "summary": 사람이 읽을 수 있는 요약,
             }
         """
-        if len(self._win_patterns) < self.learning_trades:
+        # 구 상태는 매도 시점 지표를 "매수 당시"로 잘못 기록했다(source 없음).
+        # 검증 가능한 신규 진입 표본만 사용해 과매수 청산 특성이 매수 선호로 새지 않게 한다.
+        win_patterns = [p for p in self._win_patterns if p.get("source") == "entry"]
+        loss_patterns = [p for p in self._loss_patterns if p.get("source") == "entry"]
+        if len(win_patterns) < self.learning_trades:
             return {"summary": "아직 학습 데이터 부족 (최소 {}건 필요)".format(self.learning_trades)}
 
-        rsis = [p["rsi"] for p in self._win_patterns if p.get("rsi") is not None]
-        vol_ratios = [p["vol_ratio"] for p in self._win_patterns if p.get("vol_ratio") is not None]
-        ma_aligned = [p["ma_aligned"] for p in self._win_patterns if p.get("ma_aligned") is not None]
-        rates = [p["realized_rate"] for p in self._win_patterns]
-        bb_positions = [p["bb_position"] for p in self._win_patterns if p.get("bb_position")]
+        rsis = [p["rsi"] for p in win_patterns if p.get("rsi") is not None]
+        vol_ratios = [p["vol_ratio"] for p in win_patterns if p.get("vol_ratio") is not None]
+        ma_aligned = [p["ma_aligned"] for p in win_patterns if p.get("ma_aligned") is not None]
+        rates = [p["realized_rate"] for p in win_patterns]
+        bb_positions = [p["bb_position"] for p in win_patterns if p.get("bb_position")]
 
         avg_rsi = sum(rsis) / len(rsis) if rsis else None
         avg_vol = sum(vol_ratios) / len(vol_ratios) if vol_ratios else None
@@ -294,8 +312,8 @@ class RewardEngine:
             "preferred_ma_aligned": pref_ma,
             "avg_vol_ratio": round(avg_vol, 2) if avg_vol else None,
             "best_bb_position": best_bb,
-            "win_count": len(self._win_patterns),
-            "loss_count": len(self._loss_patterns),
+            "win_count": len(win_patterns),
+            "loss_count": len(loss_patterns),
             "avg_win_rate": round(avg_rate, 2),
             "streak": self._streak,
             "summary": " / ".join(parts) if parts else "뚜렷한 패턴 미발견",
@@ -304,11 +322,12 @@ class RewardEngine:
 
     def get_losing_conditions(self) -> dict:
         """과거 손실 거래의 공통 조건 — 회피용."""
-        if len(self._loss_patterns) < 3:
+        loss_patterns = [p for p in self._loss_patterns if p.get("source") == "entry"]
+        if len(loss_patterns) < 3:
             return {"summary": "손실 데이터 부족"}
 
-        rsis = [p["rsi"] for p in self._loss_patterns if p.get("rsi") is not None]
-        rates = [p["realized_rate"] for p in self._loss_patterns]
+        rsis = [p["rsi"] for p in loss_patterns if p.get("rsi") is not None]
+        rates = [p["realized_rate"] for p in loss_patterns]
 
         avg_rsi = sum(rsis) / len(rsis) if rsis else None
         avg_rate = sum(rates) / len(rates) if rates else 0
@@ -321,7 +340,7 @@ class RewardEngine:
         return {
             "avg_rsi_at_loss": round(avg_rsi, 1) if avg_rsi else None,
             "avg_loss_rate": round(avg_rate, 2),
-            "loss_count": len(self._loss_patterns),
+            "loss_count": len(loss_patterns),
             "summary": " / ".join(parts),
         }
 
@@ -383,7 +402,9 @@ class RewardEngine:
                 )
 
         top_contexts = sorted(
-            ((name, c) for name, c in report["contexts"].items() if c["trades"] > 0),
+            ((name, c) for name, c in report["contexts"].items()
+             if c["trades"] > 0
+             and name.rsplit(":", 1)[-1] not in EXIT_ONLY_CONTEXT_SUFFIXES),
             key=lambda item: item[1]["weight"],
             reverse=True,
         )[:3]

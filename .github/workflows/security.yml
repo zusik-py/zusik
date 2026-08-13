@@ -29,7 +29,7 @@ jobs:
     continue-on-error: true        # 자문용 — 전이 의존성 CVE 로 빌드를 막지는 않음(경보만)
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: pip-audit
@@ -42,7 +42,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.8"    # 운영 서버 버전으로 검증
       - name: 코드 무결성 트립와이어 (security_manifest.json 기준)

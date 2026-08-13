@@ -83,8 +83,12 @@ class InverseHedgeMixin:
             except Exception:
                 pass
             try:
-                cr = float(self.client.get_us_current_price(ticker, exchange).get("change_rate", 0) or 0)
-                intraday_changes.append(cr / 100.0)
+                # 미국 장중일 때만 — 마감 후엔 전일 등락률이 얼어붙은 채 min()에 잡혀
+                # KR 장중 반등을 가림 (라이브: 정지된 QQQ -1.9%가 bear를 0.32에 고정,
+                # 청산 임계 0.25 미달 지속 → KOSPI V반등에도 인버스 홀드 → 갭 손실)
+                if self.client.us_market_phase() == "open":
+                    cr = float(self.client.get_us_current_price(ticker, exchange).get("change_rate", 0) or 0)
+                    intraday_changes.append(cr / 100.0)
             except Exception:
                 pass
 
@@ -158,6 +162,16 @@ class InverseHedgeMixin:
         inv = (self.config.get("inverse", {}) or {})
         if not inv.get("enabled", False):
             return False, "인버스 비활성 (config.inverse.enabled=false)"
+        # 마감 임박(EOD 락인 윈도) 신규 진입 금지 — 장중 이득은 몇 분뿐인데 익일 개장
+        # 갭 위험은 전부 진다(인버스 비대칭 갭). 라이브 07-16: 15:06 EOD 수익 락인 매도
+        # 12분 뒤 급락 가드가 같은 종목을 되사서 락인 목적을 무효화 + 왕복 수수료.
+        try:
+            window = int(inv.get("eod_lock_window_min", 20) or 20)
+            for _mtc in (self.client.minutes_to_close(), self.client.us_minutes_to_close()):
+                if _mtc is not None and 0 <= _mtc <= window:
+                    return False, f"마감 {_mtc}분 전 — EOD 윈도 내 신규 헷지 금지 (익일 갭 위험)"
+        except Exception:
+            pass
         mc = getattr(self, "_market_condition", "peace")
         if inv.get("trigger_crisis", True) and mc in ("crisis", "war"):
             return True, f"진짜 하락장 ({mc}) — 인버스 헷지 발동"
@@ -183,6 +197,17 @@ class InverseHedgeMixin:
         score = self._bearish_regime_score()
         if score < 0.25:
             return True, f"평시 복귀 + 급락 해소 + bear {score:.2f} < 0.25 — 인버스 청산"
+        # 반등 확인 청산: KR 지수 프록시가 당일 +0.5% 이상 반등이면 헷지 명제(지수 급락)
+        # 자체가 무효 — bear 점수가 0.25~0.50 데드존에 걸려 있어도 나온다. 일봉 모멘텀·
+        # 스테일 프록시가 점수를 붙들어 V반등일에 홀드→익일 갭 손실 나던 패턴 차단.
+        try:
+            kospi_code = self._INDEX_PROXIES_KR[0][0]
+            cr = float(self.client.get_current_price(kospi_code).get("change_rate", 0) or 0)
+            if cr >= 0.5:
+                return True, (f"지수 당일 반등 +{cr:.1f}% (bear {score:.2f} 데드존 무시) — "
+                              f"헷지 명제 해소, 인버스 청산")
+        except Exception:
+            pass
         return False, ""
 
     def _inverse_eod_lock_due(self, market: str, holding: "dict | None",

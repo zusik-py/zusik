@@ -210,6 +210,26 @@ class RiskExitMixin:
             logger.info("매수 차단 (%s): 일중 %.1f%% 하락 — crash_instant 직전 위험",
                         name, intraday * 100)
             return True
+        # 유동성 게이트: 20일 평균 거래대금이 하한 미만이면 매수 차단 (KR 일반주만).
+        # 실측: 미창석유(평균 4.4억, 최소 0.9억) — LLM이 "거래량 20일 평균의 17%로 얇다"
+        # 경고문을 쓰면서도 만장일치 보너스로 확신도 94%가 돼 매수됨. 저유동성은 슬리피지·
+        # 갭·탈출불가 위험이라 LLM 판단 이전에 로컬에서 끊는다. 인버스/whitelist 면제,
+        # 거래량 데이터 없으면 통과(데이터 결함으로 매매 정지 방지). US는 스크리너가
+        # 대형주 위주라 보류 — 필요 시 USD 임계로 확장.
+        if (df is not None and "volume" in df and len(df) >= 21
+                and code.isdigit() and not self._is_inverse(code)
+                and not self._is_whitelist(code)):
+            try:
+                min_turnover = float(self.config.get("risk", {}).get(
+                    "min_avg_turnover_krw", 1_000_000_000))
+                avg_turnover = float((df["close"] * df["volume"]).iloc[-21:-1].mean())
+                if 0 < avg_turnover < min_turnover:
+                    logger.info("매수 차단 (%s): 20일 평균 거래대금 %.1f억 < 하한 %.0f억 (저유동성)",
+                                name, avg_turnover / 1e8, min_turnover / 1e8)
+                    return True
+            except Exception:
+                pass
+
         # 추세 필터: 데드크로스 + 60일선 아래면 매수 차단 (인버스 우회)
         if df is not None and not self._is_inverse(code):
             weak, wreason = self._is_weak_trend(df)
@@ -433,17 +453,41 @@ class RiskExitMixin:
         self._daily_target_cooldown = (self._daily_target_reached == today)
 
         # 3) 일일 손실한도 — 시장별 판정. 한도 자체는 총자산 비례(위에서 계산)를 공유.
+        # 평시(peace)에서는 인버스 헷지 손익을 판정에서 제외한다 — 헷지 손실은 보험료
+        # 성격인데(급락 대비 비용) 그게 한도를 밀어 올려 반등장 전체를 정지시키던 문제.
+        # 위기(peace 아님) 중에는 기존대로 전체 손익 기준(보수 유지).
         mkey = market or "ALL"
+        _mc_now = getattr(self, "_market_condition", "peace")
+
+        def _realized_for_halt() -> int:
+            r = (self.tracker.get_realized_pnl_today(market=market)
+                 if market else realized_today)
+            pnl = r["realized_pnl"]
+            if _mc_now == "peace":
+                inv_pnl = sum(t.get("realized_pnl", 0) or 0 for t in r.get("details", [])
+                              if self._is_inverse(t.get("code", "")))
+                pnl -= inv_pnl
+            return pnl
+
         if self._daily_loss_halted.get(mkey) == today:
-            return False
+            # 평시 복귀 자동 해제: 인버스 헷지 손익 제외 시 한도 내면 매매 재개.
+            # 이후 판정도 같은 기준(_realized_for_halt)이라 flip-flop 없음 —
+            # 인버스 외 손실이 한도를 넘으면 아래에서 즉시 재중단된다.
+            if _mc_now == "peace" and not self.risk.check_daily_loss_limit(_realized_for_halt()):
+                self._daily_loss_halted.pop(mkey, None)
+                logger.info("[%s] 일일 손실한도 자동 해제 — 평시 복귀 + 인버스 헷지 비용 제외 손실 한도 내", mkey)
+                if self.discord:
+                    self.discord.notify_error(
+                        f"[{mkey}] 손실한도 매매 중단 자동 해제 — 평시 복귀, "
+                        f"인버스 헷지 비용 제외 손실이 한도 내 (매매 재개)"
+                    )
+            else:
+                return False
 
         if self._daily_loss_released.get(mkey) == today:
             pass  # 운영자가 /손실해제 — 오늘은 이 시장 손실한도 재발동 안 함 (하드스톱/긴급홀딩은 별개)
         else:
-            realized_for_market = (
-                self.tracker.get_realized_pnl_today(market=market)["realized_pnl"]
-                if market else realized_today["realized_pnl"]
-            )
+            realized_for_market = _realized_for_halt()
             if self.risk.check_daily_loss_limit(realized_for_market):
                 self._daily_loss_halted[mkey] = today
                 if self.discord:

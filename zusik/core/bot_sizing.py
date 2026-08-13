@@ -46,6 +46,86 @@ class SizingModeMixin:
         from zusik.analysis.bot_money_helpers import compute_kelly_fraction
         return compute_kelly_fraction(mc)
 
+    def _entry_quality_gate(self, df, *, is_inverse: bool = False,
+                            is_add_on: bool = False) -> tuple[bool, str]:
+        """신규 진입의 로컬 품질 게이트.
+
+        청산 패턴이 매수 통계로 섞였던 기간에 RSI 84.9 같은 극단 과열 종목까지
+        ``97.3% 승률``로 추격했다. LLM 판단과 무관하게 신규 진입은 양의 모멘텀을
+        요구하고, 과열 구간은 거래량이 동반된 실제 돌파일 때만 제한적으로 허용한다.
+        인버스와 이미 수익 중인 피라미딩은 각자의 전용 규율을 사용한다.
+        """
+        cfg = self.config.get("entry_quality", {}) or {}
+        # 구형 임베더/테스트 config에는 키가 없다. 명시 활성일 때만 새 정책 적용.
+        if not cfg.get("enabled", False) or is_inverse or is_add_on:
+            return True, "전용 진입 규율"
+        if df is None or len(df) < 21:
+            return False, "OHLCV 21봉 미만"
+        try:
+            from zusik.analysis.indicators import (
+                breakout_signal, calc_rsi, momentum_score, volume_surge,
+            )
+            rsi = float(calc_rsi(df).iloc[-1])
+            momentum = float(momentum_score(df))
+            min_momentum = float(cfg.get("min_momentum", 0.08))
+            hard_rsi = float(cfg.get("hard_rsi_max", 82.0))
+            warm_rsi = float(cfg.get("breakout_required_rsi", 74.0))
+            breakout_momentum = float(cfg.get("breakout_min_momentum", 0.25))
+            volume_ratio = float(cfg.get("breakout_min_volume_ratio", 1.2))
+
+            if rsi != rsi or momentum != momentum:  # NaN
+                return False, "지표 NaN"
+            if rsi >= hard_rsi:
+                return False, f"RSI {rsi:.1f} ≥ {hard_rsi:.0f} 극단 과열"
+            if momentum < min_momentum:
+                return False, f"모멘텀 {momentum:+.2f} < {min_momentum:.2f}"
+            if rsi >= warm_rsi:
+                breakout = breakout_signal(df, 20)
+                volume = volume_surge(df, 20, volume_ratio)
+                if (not breakout.get("is_breakout")
+                        or not volume.get("is_surge")
+                        or momentum < breakout_momentum):
+                    return False, (
+                        f"RSI {rsi:.1f} 과열: 돌파={bool(breakout.get('is_breakout'))}, "
+                        f"거래량={float(volume.get('ratio', 0)):.1f}배, "
+                        f"모멘텀={momentum:+.2f}"
+                    )
+            return True, f"RSI {rsi:.1f}, 모멘텀 {momentum:+.2f}"
+        except Exception as e:
+            return False, f"진입 품질 계산 실패: {e}"
+
+    def _cash_deployment_ratio(self, ratio: float, cash_ratio: float,
+                               confidence: float, symbol: str = "") -> tuple[float, str]:
+        """고품질 BUY에 한해 초과 현금을 더 빠르게 투입한다.
+
+        신호를 완화하거나 잔금을 아무 종목에 넣지 않는다. 확신도 하한을 넘긴 정상 BUY의
+        사이즈만 현금비중에 비례해 키우며, 기존 adaptive 종목 상한은 그대로 지킨다.
+        """
+        cfg = self.config.get("cash_deployment", {}) or {}
+        if not cfg.get("enabled", False):
+            return ratio, "현금 집행 OFF"
+        min_conf = float(cfg.get("min_confidence", 0.65))
+        target = float(cfg.get("target_cash_ratio", self.config.get("_cash_reserve", 0.05)))
+        full_at = max(float(cfg.get("full_boost_cash_ratio", 0.20)), target + 0.01)
+        max_boost = max(1.0, float(cfg.get("max_size_boost", 1.5)))
+        if confidence < min_conf or cash_ratio <= target:
+            return ratio, "현금 집행 조건 미달"
+
+        progress = max(0.0, min(1.0, (cash_ratio - target) / (full_at - target)))
+        boost = 1.0 + (max_boost - 1.0) * progress
+        adapt = self._adaptive_params()
+        if symbol and self._is_whitelist(symbol):
+            cap = float(adapt.get("whitelist_cap", adapt.get("cap", 0.0)) or 0.0)
+        else:
+            cap = float(adapt.get("cap", self.config.get("invest_ratio_max", 0.0)) or 0.0)
+        adjusted = ratio * boost
+        if cap > 0:
+            adjusted = min(adjusted, cap)
+        return adjusted, (
+            f"초과현금 {cash_ratio:.0%}>{target:.0%}, 확신 {confidence:.0%} "
+            f"→ ×{boost:.2f} (상한 {cap:.0%})"
+        )
+
     def _rsi_trim_ratio(self, symbol: str) -> float | None:
         """RSI 과매수 익절 분할 트림: 에피소드당 1회 절반 익절, 나머지 라이딩.
 
@@ -422,4 +502,3 @@ class SizingModeMixin:
                   + (f" (cap {max_ratio_cap:.0%})" if max_ratio_cap > 0 and final_ratio == max_ratio_cap else "")
                   + floor_note)
         return final_ratio, reason
-

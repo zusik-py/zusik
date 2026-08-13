@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -38,17 +39,46 @@ def _load_json(path: str) -> list | dict:
     if not os.path.exists(path):
         return []
     with open(path, encoding="utf-8") as f:
-        return json.load(f)
+        raw = f.read()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # 찢어진 쓰기 자가 복구 — 비원자 writer 혼용/중단으로 "유효 JSON + 잔여 바이트"
+        # 형태가 되면(equity_curve.json 'Extra data' 실측) 매 사용처가 크래시를 반복한다.
+        # 유효 프리픽스만 파싱해 살리고, 원본은 .corrupt 로 보존한다.
+        try:
+            data, end = json.JSONDecoder().raw_decode(raw)
+        except Exception:
+            logger.error("JSON 복구 불가: %s — 원본을 .corrupt 로 보존, 빈 값으로 시작", path)
+            try:
+                os.replace(path, path + ".corrupt")
+            except Exception:
+                pass
+            return []
+        try:
+            os.replace(path, path + ".corrupt")
+            _save_json(path, data)
+            logger.warning("JSON 자가 복구: %s — 유효 프리픽스 %d/%d바이트 (원본 .corrupt 보존)",
+                           path, end, len(raw))
+        except Exception:
+            logger.warning("JSON 복구본 저장 실패: %s (메모리 복구본으로 계속)", path, exc_info=True)
+        return data
+
+
+_SAVE_LOCK = threading.Lock()
 
 
 def _save_json(path: str, data):
     _ensure_dir()
     # 원자적 쓰기: trades.json 파손 = 실현손익·재진입가드 전체 손상.
     # 과거 .bak_* 수동 복구 파일들이 이 클래스의 증거. tmp + os.replace로 차단.
-    tmp = str(path) + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    # 락 + 스레드별 tmp 이름: EOD 락인 매도와 수동매매 동기화가 동시에 저장하면
+    # 같은 .tmp를 서로 rename해 FileNotFoundError (라이브 07-16 15:06 실측).
+    with _SAVE_LOCK:
+        tmp = f"{path}.tmp.{threading.get_ident()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
 
 
 class PortfolioTracker:
@@ -532,8 +562,16 @@ class PortfolioTracker:
         post = [t for t in sells if (t.get("date", "") >= baseline_date)]
         return {"baseline": baseline_date, "pre": _agg(pre), "post": _agg(post)}
 
-    def record_buy(self, code: str, name: str, qty: int, price: int, is_long_term: bool = False, reason: str = ""):
-        """매수 기록."""
+    def record_buy(self, code: str, name: str, qty: int, price: int,
+                   is_long_term: bool = False, reason: str = "",
+                   entry_context: str = "", entry_indicators: dict | None = None,
+                   entry_analyst_details: dict | None = None):
+        """매수 기록.
+
+        ``entry_context``는 보상 엔진의 *진입 시점* 시장/셋업 라벨이다. 매도 때
+        ``rsi_overbought`` 같은 청산 라벨을 진입 성과로 오인하지 않도록 체결과 함께
+        보존한다. 구 호출부는 빈 값으로 호환된다.
+        """
         record = {
             "type": "buy",
             "code": code,
@@ -543,6 +581,9 @@ class PortfolioTracker:
             "amount": qty * price,
             "is_long_term": is_long_term,
             "reason": reason,
+            "entry_context": entry_context,
+            "entry_indicators": entry_indicators or {},
+            "entry_analyst_details": entry_analyst_details or {},
             "timestamp": datetime.now().isoformat(),
             "date": datetime.now().strftime("%Y-%m-%d"),
             **self._market_meta(code),
@@ -632,6 +673,7 @@ class PortfolioTracker:
         curr = {h[key_field]: h for h in current_holdings if h.get("qty", 0) > 0}
 
         manual_sells = 0
+        carry_suspects: dict = {}  # 1차 감지 종목 — 이전 수량 그대로 이월해 다음 회차 재판정
         for code, prev_state in list(prev.items()):
             prev_qty = prev_state.get("qty", 0)
             if prev_qty <= 0:
@@ -667,6 +709,18 @@ class PortfolioTracker:
                     logger.info("수동 매도 보류: %s — 최근 봇 주문 race로 판단, 기록 스킵", code)
                     continue
 
+                # 2-패스 확정: 첫 감지에선 기록하지 않고 의심 마커만 남긴다.
+                # 봇 매도의 주문→잔고감소→record_sell 사이에 동기화가 끼면 위 가드들이
+                # 서브초 race로 뚫려 같은 매도가 '수동'으로 이중 계상됨(07-16 15:06 실측,
+                # EOD 락인과 동시 기록 + 저장 충돌 크래시). 다음 동기화(수 분 뒤)까지
+                # 봇 기록이 나타나면 위 untracked_qty 차감으로 자연 소거되고,
+                # 그래도 남아 있으면 진짜 수동 매도로 확정 기록한다.
+                if not prev_state.get("manual_suspect"):
+                    carry_suspects[code] = {**prev_state,
+                                            "manual_suspect": datetime.now().isoformat()}
+                    logger.info("수동 매도 의심 1차 감지: %s %d주 — 다음 동기화에서 확정", code, sold_qty)
+                    continue
+
                 # KRW 환산 (US 종목)
                 sell_krw = int(est_sell_price * fx_rate)
                 avg_krw = int(avg_price_prev * fx_rate)
@@ -680,7 +734,7 @@ class PortfolioTracker:
                                market, name, untracked_qty,
                                f"{sell_krw:,}원", prev_qty, curr_qty)
 
-        # 새 스냅샷 저장
+        # 새 스냅샷 저장 — 의심 종목은 이전 수량을 이월해 다음 회차에 감소를 재감지
         snapshot[market] = {
             h[key_field]: {
                 "name": h.get("name", h[key_field]),
@@ -691,6 +745,7 @@ class PortfolioTracker:
             }
             for h in current_holdings if h.get("qty", 0) > 0
         }
+        snapshot[market].update(carry_suspects)
         os.makedirs(DATA_DIR, exist_ok=True)
         _save_json(HOLDINGS_SNAPSHOT_FILE, snapshot)
 
@@ -792,6 +847,29 @@ class PortfolioTracker:
             if t.get("type") == "buy" and t.get("code") == code:
                 return str(t.get("reason") or "")
         return ""
+
+    def get_last_buy_context(self, code: str) -> str:
+        """종목의 마지막 매수에 저장된 진입 컨텍스트 반환 (구 기록은 빈 문자열)."""
+        for t in reversed(self._trades):
+            if t.get("type") == "buy" and t.get("code") == code:
+                return str(t.get("entry_context") or "")
+        return ""
+
+    def get_last_buy_indicators(self, code: str) -> dict:
+        """마지막 매수 당시 지표. 구 기록/잔금 주문은 빈 dict."""
+        for t in reversed(self._trades):
+            if t.get("type") == "buy" and t.get("code") == code:
+                v = t.get("entry_indicators")
+                return dict(v) if isinstance(v, dict) else {}
+        return {}
+
+    def get_last_buy_analyst_details(self, code: str) -> dict:
+        """마지막 매수 판단에 참여한 애널리스트별 신호."""
+        for t in reversed(self._trades):
+            if t.get("type") == "buy" and t.get("code") == code:
+                v = t.get("entry_analyst_details")
+                return dict(v) if isinstance(v, dict) else {}
+        return {}
 
     # ── 장기투자 관리 ──
 

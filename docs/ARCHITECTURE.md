@@ -14,7 +14,7 @@ flowchart TD
     subgraph EXT[외부 시스템]
         KIS["KIS OpenAPI<br/>시세 · 주문 · 잔고"]
         UPBIT["Upbit<br/>암호화폐"]
-        LLM["LLM CLI / API<br/>claude · codex · agy"]
+        LLM["LLM CLI<br/>Codex 주 · agy/Claude 폴백"]
         MSG["메신저<br/>Discord · Telegram · Slack"]
     end
 
@@ -352,8 +352,9 @@ flowchart TD
   과대수량을 거부합니다. 위반과 검증 예외 모두 fail-closed(미전송)입니다. 정정/취소도 `validate_amend` 가 같은 관문을 거칩니다.
 - Phantom 주문 검증: `rt_cd=0` 은 "전송 완료"일 뿐 체결 보장이 아닙니다. KR 매수/매도 후 3초 뒤
   잔고 재조회로 실제 변화를 확인합니다(미체결이면 success=False). 폭락일 헷지 미작동 사고의 root-cause fix.
-- LLM 권한 격리: agent CLI 는 거래소/메신저 시크릿을 제거한 env 로 실행하고(`_child_env`),
-  claude 는 `--disallowedTools` 로 셸/파일 도구를 차단합니다. 프롬프트 인젝션을 통한 로컬 접근 경로를 제거합니다.
+- LLM 권한 격리: agent CLI는 거래소/메신저 시크릿을 제거한 env로 실행합니다(`_child_env`).
+  주 provider인 Codex는 빈 임시 디렉터리 + `read-only` sandbox + ephemeral 세션으로 격리하고,
+  Claude 폴백은 `--disallowedTools`로 셸/파일 도구를 차단합니다.
 
 ---
 

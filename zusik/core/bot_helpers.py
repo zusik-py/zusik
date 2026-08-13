@@ -240,6 +240,68 @@ class CoreHelpersMixin:
             pass
         return 0
 
+    def _record_buy_with_context(self, code: str, name: str, qty: int, price,
+                                 is_long_term: bool, reason: str,
+                                 entry_context: str = "",
+                                 entry_indicators: dict | None = None,
+                                 entry_analyst_details: dict | None = None):
+        """PortfolioTracker 신·구 시그니처를 모두 지원하는 매수 기록 어댑터.
+
+        실운영 Tracker는 진입 컨텍스트를 원자적으로 저장한다. 오래된 플러그인이나 테스트
+        Tracker가 새 키워드를 모르면 기존 6인자 호출로 폴백한다.
+        """
+        import inspect
+        fn = self.tracker.record_buy
+        try:
+            signature_params = inspect.signature(fn).parameters
+            supports_kwargs = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in signature_params.values()
+            )
+        except (TypeError, ValueError):
+            signature_params = {}
+            supports_kwargs = False
+        metadata = {
+            "entry_context": entry_context,
+            "entry_indicators": entry_indicators,
+            "entry_analyst_details": entry_analyst_details,
+        }
+        compatible = {
+            key: value for key, value in metadata.items()
+            if supports_kwargs or key in signature_params
+        }
+        return fn(code, name, qty, price, is_long_term, reason, **compatible)
+
+    def _last_entry_context(self, code: str) -> str:
+        """구형 Tracker 호환 진입 컨텍스트 조회."""
+        fn = getattr(self.tracker, "get_last_buy_context", None)
+        if callable(fn):
+            try:
+                return str(fn(code) or "")
+            except Exception:
+                pass
+        return ""
+
+    def _last_entry_indicators(self, code: str) -> dict:
+        fn = getattr(self.tracker, "get_last_buy_indicators", None)
+        if callable(fn):
+            try:
+                value = fn(code)
+                return dict(value) if isinstance(value, dict) else {}
+            except Exception:
+                pass
+        return {}
+
+    def _last_entry_analyst_details(self, code: str) -> dict:
+        fn = getattr(self.tracker, "get_last_buy_analyst_details", None)
+        if callable(fn):
+            try:
+                value = fn(code)
+                return dict(value) if isinstance(value, dict) else {}
+            except Exception:
+                pass
+        return {}
+
     def _get_name(self, code: str) -> str:
         if code not in self._name_cache:
             try:
@@ -1330,11 +1392,14 @@ class CoreHelpersMixin:
         post_market_report 경로의 `_update_equity_curve(deposit_today=…)`(line 3080)는
         tracker를 거쳐 별도 snap 생성 — 두 메서드가 동시에 존재해야 한다.
         """
-        from zusik.storage.portfolio_tracker import EQUITY_CURVE_FILE
+        from zusik.storage.portfolio_tracker import EQUITY_CURVE_FILE, _load_json, _save_json
         if not os.path.exists(EQUITY_CURVE_FILE):
             return
-        with open(EQUITY_CURVE_FILE) as f:
-            curve = json.load(f)
+        # 로드/저장 모두 tracker 공용 경로로 — 이전의 raw open("w") 직접 쓰기가
+        # tracker의 원자 저장과 경합해 파일을 찢던(Extra data 파손) 원인.
+        curve = _load_json(EQUITY_CURVE_FILE)
+        if not isinstance(curve, list):
+            return
         max_eq = max(*(d.get("max_equity", 0) for d in curve), total) if curve else total
         snap["max_equity"] = max_eq
         snap["drawdown_pct"] = round((total - max_eq) / max_eq * 100, 2) if max_eq > 0 else 0
@@ -1342,6 +1407,4 @@ class CoreHelpersMixin:
             curve[-1] = snap
         else:
             curve.append(snap)
-        with open(EQUITY_CURVE_FILE, "w") as f:
-            json.dump(curve, f, ensure_ascii=False, indent=2)
-
+        _save_json(EQUITY_CURVE_FILE, curve)

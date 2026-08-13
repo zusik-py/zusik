@@ -37,6 +37,20 @@ class ClaudeAnalystJudgeTests(unittest.TestCase):
         self.assertEqual(final["confidence"], 0.7)
         self.assertIn("만장일치 +20%", final["reasoning"])
 
+    def test_judge_two_analyst_unanimity_gets_half_bonus(self):
+        """회귀: quick 모드(2명)의 2/2 만장일치가 +20%p를 받아 확신도가 부풀던 문제
+        (실측 0.74→0.94, 7일간 8회). 표본 2개 합의는 +10%만."""
+        results = {
+            "fundamental": _result("buy", confidence=0.6),
+            "sentiment": _result("buy", confidence=0.6),
+            "quant": _result("hold", reasoning="미호출"),
+            "generalist": _result("hold", reasoning="미호출"),
+        }
+        final = self.analyst._judge(results, indicators={})
+        self.assertEqual(final["signal"], "buy")
+        self.assertEqual(final["confidence"], 0.7)  # 0.6 + 0.1 (not 0.8)
+        self.assertIn("만장일치(2인) +10%", final["reasoning"])
+
     def test_judge_adds_majority_bonus_without_opposition(self):
         results = {
             "fundamental": _result("buy"),

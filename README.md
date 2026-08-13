@@ -100,9 +100,11 @@ flowchart TD
   실제로 빠질 때만 사고(시장별 무차별 매수 차단), 순익 +1.5% 면 바로 익절해 작은 수익을 챙긴다 (`inverse.*`)
 - **멀티 마켓**: 한국·미국 주식과 업비트 암호화폐를 각 시장 시간에 맞춰 운용. 시장별로 끌 수 있다(`us_enabled` / `kr_enabled`)
 - **멀티 메신저 양방향**: Discord, Telegram, Slack 동시 알림과 명령 원격 제어 지원 (백엔드 교체식)
-- **AI 사용량 최적화**: claude/codex/agy(Antigravity) 멀티 CLI 분산, provider 실패 자동 cooldown,
-  요금제·개수에 맞춘 일일 한도 자동 설정(`setup.sh` 마법사), 웹검색/캐시 조절. CLI 가 없어도 로컬
-  퀀트 전략만으로 매매
+- **Codex 중심 AI 분석**: 모든 LLM 티어에서 Codex를 먼저 사용하고, 한도·로그인·실패 시
+  agy/Claude/로컬 LLM으로 자동 폴백. 요금제별 일일 한도(`setup.sh` 마법사), cooldown,
+  웹검색/캐시를 지원하며 CLI가 없어도 로컬 퀀트 전략으로 매매
+- **최신 CLI 호환**: GPT-5.6 Sol을 기본 분석 모델로 사용하고 Claude Code는 최신 모델 별칭과
+  격리된 비영속 print 모드로 호출
 - **운영 안정성**: 코어 죽음/멈춤(hang) 워치독(systemd timer + OnFailure 즉시 알림), LLM 전체 다운
   알림, 진단 명령(`/헬스`, `/점검`)으로 provider별 실시간 상태 확인
 

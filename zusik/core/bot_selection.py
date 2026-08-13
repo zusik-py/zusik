@@ -201,13 +201,13 @@ class SelectionMixin:
         added_us = new_us - old_us
         removed_us = old_us - new_us
 
-        # 선별 결과가 빈 경우 기본 종목으로 폴백
-        if not self.kr_stocks and getattr(self, "kr_enabled", True):
-            self.kr_stocks = list(self._default_kr)
-            logger.warning("선별 결과 비어있음, KR 기본 종목 유지")
-        if not self.us_stocks and getattr(self, "us_enabled", True):
-            self.us_stocks = list(self._default_us)
-            logger.warning("선별 결과 비어있음, US 기본 종목 유지")
+        # 입력 후보는 있었지만 RS 게이트에서 전부 탈락한 경우 기본 목록을 되살리지 않는다.
+        # 그 폴백이 약한 원본을 다시 매수 유니버스로 넣어 상대강도 필터를 무효화했다.
+        # 보유 종목은 run_kr/run_us에서 별도로 병합하므로 청산 관리는 계속된다.
+        if result.get("kr") and not self.kr_stocks:
+            logger.warning("KR 후보 전원 상대강도 미달 — 신규 진입 후보 없음")
+        if result.get("us") and not self.us_stocks:
+            logger.warning("US 후보 전원 상대강도 미달 — 신규 진입 후보 없음")
 
         if added_kr or removed_kr or added_us or removed_us:
             logger.info("%s — KR +%d/-%d, US +%d/-%d",
@@ -731,6 +731,12 @@ class SelectionMixin:
                         logger.info("대안 종목: %s", alts)
 
         # ── 소액 잔여금 소진: 이 종목이든 다른 종목이든 1주라도 매수 ──
+        # 최근 60일 실측: 일반 진입 +1.87M원 vs 잔금소진 -446k원. 현금 집행은
+        # _cash_deployment_ratio가 고확신 정상 BUY의 크기를 키우는 방식으로 담당한다.
+        # 저품질 우회 주문은 명시 opt-in일 때만 유지한다.
+        if not (self.config.get("cash_deployment", {}) or {}).get(
+                "allow_leftover_orders", True):
+            return
         try:
             bal_final = self.client.get_balance()
             remaining = bal_final["cash"]
@@ -929,6 +935,7 @@ class SelectionMixin:
             recently_sold = set((getattr(self, "_reentry_block", {}) or {}).keys())
             regime_on = bool(sel.get("regime_adaptive", True))
             bear_gate = float(sel.get("regime_bear_gate", 0.40))
+            min_rs = float(sel.get("min_relative_strength", self._RS_DROP_THRESHOLD))
             vol_w = float(sel.get("regime_vol_weight", 1.5))
             rot_on = bool(sel.get("rotation", True))
             rot_pen = float(sel.get("rotation_penalty", 0.03))
@@ -951,7 +958,7 @@ class SelectionMixin:
                 except Exception:
                     df = None
                 rs = self._compute_rs(df, index_df)
-                if rs < self._RS_DROP_THRESHOLD:
+                if rs < min_rs:
                     logger.info("RS 게이트 제외 (%s %s): 지수 대비 %+.1f%%p — 식은 모멘텀",
                                 market, s.get("name", sym), rs * 100)
                     continue
@@ -972,7 +979,13 @@ class SelectionMixin:
                             market, scored[0][1].get("name", ""), len(ranked), len(stocks),
                             bear, "방어(저변동)" if defensive else "모멘텀")
                 return ranked
-            return stocks  # 전부 탈락 시 원본 유지 (과도 필터 방지)
+            if exempt:
+                return exempt
+            # 전부 약하면 현금 유지. 원본 복원은 RS 게이트를 무효화해 지수
+            # 언더퍼폼 종목만 다시 매수 후보로 살리는 fail-open이었다.
+            logger.warning("RS 랭킹 [%s]: %d종 전부 기준(%+.1f%%p) 미달 — 후보 없음",
+                           market, len(stocks), min_rs * 100)
+            return []
         except Exception as e:
             logger.warning("RS 랭킹 실패 (%s): %s — 원본 유지", market, e)
             return stocks
@@ -1291,19 +1304,23 @@ class SelectionMixin:
                                               max_price=max_us_price,
                                               min_single_stocks=us_min_single)
 
+                def _screen_metric(row: dict) -> str:
+                    mc = row.get("mc")
+                    if mc:
+                        return (f"score={row['score']:.3f} "
+                                f"P={mc['p_profit']*100:.0f}% "
+                                f"VaR95={mc['var95']*100:+.1f}%")
+                    return f"{row.get('method', sel_method)} score={row['score']:.3f}"
+
                 # 결과 로그
                 logger.info("─ KR 상위 후보 ─")
                 for r in kr_top:
-                    mc = r["mc"]
-                    logger.info("  %s %s: score=%.3f P=%.0f%% VaR95=%+.1f%%",
-                                r["info"][0], r["info"][1], r["score"],
-                                mc["p_profit"] * 100, mc["var95"] * 100)
+                    logger.info("  %s %s: %s", r["info"][0], r["info"][1],
+                                _screen_metric(r))
                 logger.info("─ US 상위 후보 ─")
                 for r in us_top:
-                    mc = r["mc"]
-                    logger.info("  %s %s: score=%.3f P=%.0f%% VaR95=%+.1f%%",
-                                r["info"][0], r["info"][1], r["score"],
-                                mc["p_profit"] * 100, mc["var95"] * 100)
+                    logger.info("  %s %s: %s", r["info"][0], r["info"][1],
+                                _screen_metric(r))
 
                 # watch list 갱신 — 파생ETF 권한 없으면 제거
                 if kr_top:
@@ -1348,25 +1365,19 @@ class SelectionMixin:
                 # Discord 알림
                 if self.discord and (kr_top or us_top):
                     try:
-                        msg_lines = ["자동 스크리닝 결과 (Vortex MC 1만 path)"]
+                        msg_lines = [f"자동 스크리닝 결과 ({sel_method})"]
                         if kr_top:
                             msg_lines.append("**KR 상위:**")
                             for r in kr_top[:5]:
-                                m = r["mc"]
                                 msg_lines.append(
                                     f"  {r['info'][1]} ({r['info'][0]}): "
-                                    f"P(수익)={m['p_profit']*100:.0f}%, "
-                                    f"VaR95={m['var95']*100:+.1f}%"
-                                )
+                                    f"{_screen_metric(r)}")
                         if us_top:
                             msg_lines.append("**US 상위:**")
                             for r in us_top[:5]:
-                                m = r["mc"]
                                 msg_lines.append(
                                     f"  {r['info'][1]} ({r['info'][0]}): "
-                                    f"P(수익)={m['p_profit']*100:.0f}%, "
-                                    f"VaR95={m['var95']*100:+.1f}%"
-                                )
+                                    f"{_screen_metric(r)}")
                         self.discord.notify_info("\n".join(msg_lines))
                     except Exception:
                         pass
@@ -1374,4 +1385,3 @@ class SelectionMixin:
                 logger.exception("자동 스크리닝 오류")
 
         threading.Thread(target=_run, daemon=True).start()
-

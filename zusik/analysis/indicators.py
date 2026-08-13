@@ -21,6 +21,26 @@ import numpy as np
 import pandas as pd
 
 
+def calc_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Wilder 호환 RSI 시계열.
+
+    공용 함수가 없는데 매수 가드가 이 이름을 import한 뒤 예외를 삼키고 있어 실제로는
+    RSI 추격 차단이 한 번도 작동하지 않았다. DataFrame 입력을 표준으로 통일한다.
+    """
+    if df is None or "close" not in df.columns:
+        return pd.Series(dtype=float)
+    close = df["close"].astype(float)
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain / loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    # 상승만 있는 구간(loss=0)은 RSI 100, 하락만 있는 구간(gain=0)은 0.
+    rsi = rsi.mask((loss == 0) & (gain > 0), 100.0)
+    rsi = rsi.mask((gain == 0) & (loss > 0), 0.0)
+    return rsi
+
+
 def breakout_signal(df: pd.DataFrame, lookback: int = 20) -> dict:
     """N일 고점 돌파 시그널.
 
@@ -190,5 +210,4 @@ def slow_bleed(df: pd.DataFrame, lookback: int = 5,
 # ══════════════════════════════════════════════════
 # 배치 버전 (차후 FPGA 오프로드용)
 # ══════════════════════════════════════════════════
-
 

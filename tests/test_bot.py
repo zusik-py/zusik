@@ -1541,6 +1541,58 @@ class TradingBotScenarioTests(unittest.TestCase):
         _code, qty, _price = self.client.buy_market_calls[-1]
         self.assertEqual(qty, 1, "300k 현금에서 쿨다운 25%면 1주만 매수되어야 함")
 
+    def test_scenario_inverse_loss_halt_auto_releases_on_peace(self):
+        """인버스 헷지 손실(보험료)이 손실한도를 밀어 올려 평시 복귀 후에도 그날
+        매매가 잠기던 문제. (a) 평시에는 인버스 손익을 한도 판정에서 제외,
+        (b) 이미 중단됐어도 평시 복귀 + 인버스 제외 손실이 한도 내면 자동 해제,
+        (c) 인버스 외 실손실이 한도 초과면 그대로 중단 유지 (자본보호 revert-check)."""
+        self.bot._is_inverse = lambda c: c == "114800"
+        patches = (patch("zusik.core.trading_mode.check_mode_change", return_value=None),
+                   patch("zusik.core.trading_mode.check_deposit", return_value=None),
+                   patch("zusik.core.trading_mode.detect_market_condition", return_value="peace"))
+
+        # (a) 인버스 대손실(-100k, 한도 -45k 초과)만 있는 날 + peace → 중단 안 됨
+        self.tracker.record_sell("114800", "KODEX 인버스", 100, 1_000, 2_000, "인버스 청산")
+        with patches[0], patches[1], patches[2]:
+            self.assertTrue(self.bot._check_risks_before_trading("KR"),
+                            "평시인데 인버스 헷지 비용이 매매를 중단시킴")
+
+        # (b) 이미 중단된 상태(위기 중 발동 가정) → 평시 복귀 시 자동 해제
+        today = datetime.now().strftime("%Y-%m-%d")
+        self.bot._daily_loss_halted["KR"] = today
+        with patches[0], patches[1], patches[2]:
+            self.assertTrue(self.bot._check_risks_before_trading("KR"),
+                            "평시 복귀했는데 인버스발 중단이 자동 해제되지 않음")
+        self.assertNotIn("KR", self.bot._daily_loss_halted)
+
+        # (c) 인버스 외 일반주 실손실이 한도 초과 → 평시여도 중단 유지 (자본보호)
+        self.tracker.record_sell("005930", "삼성전자", 10, 40_000, 50_000, "일반 손절")
+        with patches[0], patches[1], patches[2]:
+            self.assertFalse(self.bot._check_risks_before_trading("KR"),
+                             "일반주 실손실 한도 초과인데 매매가 계속됨 — 자본보호 파괴")
+
+    def test_low_liquidity_stock_buy_blocked(self):
+        """회귀: 20일 평균 거래대금 4.4억짜리 초저유동성 종목(미창석유형)이 LLM
+        확신도만으로 매수되던 문제 — 하한(기본 10억) 미만이면 로컬에서 차단."""
+        import pandas as pd
+        # 평균 거래대금 ~1.4억 (10만원 × 1,400주) — 하한 10억 미달
+        thin = pd.DataFrame({
+            "open": [100_000] * 30, "high": [101_000] * 30, "low": [99_000] * 30,
+            "close": [100_000] * 30, "volume": [1_400] * 30,
+        })
+        blocked = self.bot._churn_guard("003650", "미창석유", df=thin, price=100_000)
+        self.assertTrue(blocked, "저유동성 종목 매수가 차단되지 않음")
+
+        # 정상 유동성(1000억대) + 완만한 상승 추세는 통과 — 게이트가 죽지 않았는지
+        # revert-check. (가격 평평이면 MC 게이트가 별도로 차단하므로 상승 추세 부여)
+        ups = [100_000 + i * 300 for i in range(30)]
+        fat = pd.DataFrame({
+            "open": ups, "high": [p + 500 for p in ups], "low": [p - 500 for p in ups],
+            "close": ups, "volume": [1_000_000] * 30,
+        })
+        passed = not self.bot._churn_guard("005380", "현대차2", df=fat, price=ups[-1])
+        self.assertTrue(passed, "정상 유동성 종목까지 차단됨")
+
     def test_virtual_account_rate_limited_to_one_call_per_sec(self):
         """모의투자는 KIS가 초당 1건만 허용 — 성숙 계정(KIS_API_MATURE)이어도
         is_virtual이면 호출 간격이 1초 이상 벌어져야 한다. 실전은 그대로 빠르게."""
@@ -3146,6 +3198,155 @@ class LossPatternRegressionTests(unittest.TestCase):
         self.assertFalse(TradingBot._inverse_deep_collapse(shallow),
                          "인버스 -7% 당일급락은 컷 금지(레짐 강제청산 위임)")
         self.assertFalse(TradingBot._inverse_deep_collapse(None))
+
+    def test_manual_sell_needs_two_pass_confirmation(self):
+        """회귀 (07-16 15:06 실측): EOD 락인 매도와 수동매매 동기화가 서브초 race로
+        같은 매도를 '수동'으로 이중 계상. 첫 감지는 의심 마커만, 다음 회차에
+        봇 기록이 있으면 소거·없으면 확정."""
+        import json
+        import tempfile
+        from zusik.storage import portfolio_tracker as pt
+
+        with tempfile.TemporaryDirectory() as td:
+            snap = os.path.join(td, "snap.json")
+            with patch.object(pt, "HOLDINGS_SNAPSHOT_FILE", snap):
+                tr = pt.PortfolioTracker.__new__(pt.PortfolioTracker)
+                tr._trades = []
+                tr._save_trades = lambda: None
+                tr._recent_bot_order = lambda code, minutes=15: False
+
+                # 스냅샷: 530주 보유 → 현재 0주 (봇 EOD 매도 직후, 기록은 아직 race 중)
+                with open(snap, "w") as f:
+                    json.dump({"KR": {"114800": {"name": "KODEX 인버스", "qty": 530,
+                                                 "avg_price": 1_100, "current_price": 1_110}}}, f)
+                n1 = tr.reconcile_external_trades([], market="KR")
+                self.assertEqual(n1, 0, "1차 감지에서 바로 수동 매도로 기록됨 (race 이중계상)")
+
+                # 다음 회차 전에 봇 record_sell이 도착한 상황 → 소거되어야 함
+                tr._trades = [{"type": "sell", "code": "114800", "qty": 530,
+                               "date": datetime.now().strftime("%Y-%m-%d")}]
+                n2 = tr.reconcile_external_trades([], market="KR")
+                self.assertEqual(n2, 0, "봇 기록이 있는데 수동 매도로 이중 기록됨")
+
+                # 반대로 봇 기록이 끝내 없으면(진짜 수동) 2차에서 확정 기록
+                with open(snap, "w") as f:
+                    json.dump({"KR": {"005930": {"name": "삼성전자", "qty": 10,
+                                                 "avg_price": 50_000, "current_price": 60_000}}}, f)
+                tr._trades = []
+                recorded = []
+                tr.record_sell = lambda *a, **k: recorded.append(a)
+                self.assertEqual(tr.reconcile_external_trades([], market="KR"), 0)  # 1차 의심
+                tr.reconcile_external_trades([], market="KR")                        # 2차 확정
+                self.assertEqual(len(recorded), 1, "진짜 수동 매도가 2차에서 기록되지 않음")
+
+    def test_inverse_entry_blocked_in_eod_window(self):
+        """회귀 (07-16): 15:06 EOD 수익 락인 매도 12분 뒤 급락 가드가 같은 인버스를
+        되사서 락인 목적(익일 갭 회피)을 무효화 + 왕복 수수료. 마감 임박 윈도(20분)
+        안에서는 신규 헷지 진입 금지."""
+        from zusik.core.bot import TradingBot
+        bot = TradingBot.__new__(TradingBot)
+        bot.derivative_etf_enabled = True
+        bot.config = {"inverse": {"enabled": True}}
+        bot._market_condition = "peace"
+        bot._fast_fall_active = True  # 급락 가드 켜짐 — 원래라면 진입 허용
+        bot.client = Mock(minutes_to_close=Mock(return_value=12),
+                          us_minutes_to_close=Mock(return_value=None))
+        allow, reason = bot._should_allow_inverse_entry()
+        self.assertFalse(allow, "마감 12분 전인데 신규 헷지 진입 허용됨")
+        self.assertIn("마감", reason)
+
+        # 윈도 밖(마감 90분 전)이면 기존대로 급락 가드 진입 허용 — revert-check
+        bot.client = Mock(minutes_to_close=Mock(return_value=90),
+                          us_minutes_to_close=Mock(return_value=None))
+        allow2, _ = bot._should_allow_inverse_entry()
+        self.assertTrue(allow2, "윈도 밖 정상 헷지 진입까지 차단됨")
+
+    def test_load_json_self_heals_torn_file(self):
+        """회귀 (07-21 실측): equity_curve.json이 '유효 JSON + 잔여 바이트'로 찢어져
+        모든 사용처가 JSONDecodeError를 반복. 유효 프리픽스를 살리고 원본은 .corrupt
+        보존, 완전 파손은 빈 값 폴백."""
+        import tempfile
+        from zusik.storage.portfolio_tracker import _load_json
+
+        with tempfile.TemporaryDirectory() as td:
+            # (a) 찢어진 파일: 유효 배열 + 잔여 바이트 → 프리픽스 복구
+            torn = os.path.join(td, "torn.json")
+            with open(torn, "w") as f:
+                f.write('[{"date": "2026-07-15", "total": 100}]' + '\n  }\n]')
+            data = _load_json(torn)
+            self.assertEqual(len(data), 1)
+            self.assertEqual(data[0]["date"], "2026-07-15")
+            self.assertTrue(os.path.exists(torn + ".corrupt"), "원본 증거 미보존")
+            import json as _json
+            _json.load(open(torn))  # 복구본이 정상 JSON으로 재저장됐는지
+
+            # (b) 완전 파손 → 빈 값 폴백 + 증거 보존 (크래시 루프 금지)
+            dead = os.path.join(td, "dead.json")
+            with open(dead, "w") as f:
+                f.write("not json at all {{{")
+            self.assertEqual(_load_json(dead), [])
+            self.assertTrue(os.path.exists(dead + ".corrupt"))
+
+            # (c) 정상 파일은 그대로 — revert-check
+            ok = os.path.join(td, "ok.json")
+            with open(ok, "w") as f:
+                f.write('[{"x": 1}]')
+            self.assertEqual(_load_json(ok), [{"x": 1}])
+            self.assertFalse(os.path.exists(ok + ".corrupt"))
+
+    def test_save_json_thread_safe(self):
+        """회귀 (07-16 15:06): 동시 저장이 같은 .tmp를 rename해 FileNotFoundError."""
+        import tempfile, threading as th
+        from zusik.storage.portfolio_tracker import _save_json
+        errors = []
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "t.json")
+            def worker():
+                try:
+                    for _ in range(30):
+                        _save_json(path, [{"x": 1}])
+                except Exception as e:
+                    errors.append(e)
+            threads = [th.Thread(target=worker) for _ in range(8)]
+            [t.start() for t in threads]
+            [t.join() for t in threads]
+        self.assertEqual(errors, [], f"동시 저장 크래시: {errors[:2]}")
+
+    def test_inverse_rebound_exit_escapes_bear_deadzone(self):
+        """회귀 (실측 -182k): V반등일에 스테일 미국 프록시(-1.9% 정지)가 bear를 0.32에
+        고정 → 청산 임계 0.25 미달 지속 → 인버스 홀드 → 익일 갭 손실.
+        (a) peace + KOSPI 당일 +0.5%↑ 반등이면 bear 데드존이어도 청산.
+        (b) bear 계산은 미국 장 마감 중 US intraday를 제외해야 한다."""
+        from zusik.core.bot import TradingBot
+
+        bot = TradingBot.__new__(TradingBot)
+        bot._market_condition = "peace"
+        bot._index_crash = lambda: False
+        bot._bearish_regime_score = lambda: 0.32          # 데드존 (0.25~0.50)
+        bot.client = Mock()
+        bot.client.get_current_price = Mock(return_value={"change_rate": 1.2})
+        ok, reason = bot._should_force_exit_inverse()
+        self.assertTrue(ok, "지수 +1.2% 반등에도 bear 데드존에 막혀 인버스 홀드")
+        self.assertIn("반등", reason)
+
+        # 반등 미달(+0.2%)이면 기존대로 홀드 — 청산 임계 자체가 죽지 않았는지 revert-check
+        bot.client.get_current_price = Mock(return_value={"change_rate": 0.2})
+        ok2, _ = bot._should_force_exit_inverse()
+        self.assertFalse(ok2, "반등 미달인데 청산됨 — 데드존 홀드 계약 파괴")
+
+        # (b) 미국 장 마감 중엔 US intraday가 bear 계산에 안 들어간다
+        bot2 = TradingBot.__new__(TradingBot)
+        bot2._bear_cache = (0.0, 0.0)
+        bot2.client = Mock()
+        bot2.client.get_ohlcv = Mock(return_value=None)
+        bot2.client.get_us_ohlcv = Mock(return_value=None)
+        bot2.client.us_market_phase = Mock(return_value="closed")
+        bot2.client.get_current_price = Mock(return_value={"change_rate": 1.0})   # KR +1%
+        bot2.client.get_us_current_price = Mock(return_value={"change_rate": -1.9})  # 정지된 전일
+        bot2.client.get_balance = Mock(return_value={"holdings": []})
+        bot2.client.get_us_balance = Mock(return_value={"holdings": []})
+        score = bot2._bearish_regime_score()
+        self.assertLess(score, 0.25, "마감된 미국 프록시의 정지 등락률이 bear를 붙들고 있음")
 
     def test_inverse_deep_collapse_still_cuts(self):
         """깊은 붕괴(-15%↓ / 고점급락 crash_from_high)는 자본보호 하드스톱으로 여전히 컷."""
@@ -5044,7 +5245,8 @@ class RegimeSelectionTests(unittest.TestCase):
         b._bearish_regime_score = lambda: bear
         b._compute_rs = lambda df, idx: df.get("rs", 0.0) if isinstance(df, dict) else 0.0
         b._realized_vol = lambda df: df.get("vol", 0.02) if isinstance(df, dict) else 0.0
-        idx = Mock(); idx.empty = False
+        idx = Mock()
+        idx.empty = False
         b.client = Mock()
         b.client.get_ohlcv.side_effect = lambda sym, **k: (idx if sym == "069500"
                                                            else self.DATA.get(sym, {"rs": 0.0, "vol": 0.02}))
@@ -5093,6 +5295,31 @@ class RegimeSelectionTests(unittest.TestCase):
         order = self._order(b._rank_by_relative_strength(stocks, "KR"))
         self.assertEqual(order[0], "012450", "활성 이벤트 섹터(방산) 종목이 부스트로 우선이어야 함")
 
+    def test_all_weak_candidates_do_not_fail_open_to_original(self):
+        """RS 전원 탈락 시 약한 원본을 되살리면 필터가 무효화돼 죽은 자본을 다시 산다."""
+        b = self._bot(bear=0.10)
+        b.config["selection"]["min_relative_strength"] = 0.0
+        b._compute_rs = lambda df, idx: -0.01
+        self.assertEqual(b._rank_by_relative_strength(self._stocks(), "KR"), [])
+
+    def test_apply_does_not_restore_defaults_after_all_rs_rejected(self):
+        """실제 적용 단계도 빈 랭킹을 기본 종목으로 되돌리지 않아야 한다."""
+        b = self._bot(bear=0.10)
+        b.config["selection"]["min_relative_strength"] = 0.0
+        b._compute_rs = lambda df, idx: -0.01
+        b.kr_enabled, b.us_enabled = True, False
+        b.kr_stocks, b.us_stocks = self._stocks(), []
+        b._default_kr, b._default_us = [{"code": "DEFAULT"}], []
+        b._filter_derivatives = lambda stocks, market: list(stocks)
+        b._check_stock_price = lambda code, max_price: True
+        b._name_cache = {}
+        b.discord = None
+        b.client.get_balance.return_value = {"cash": 1_000_000, "total_eval": 1_000_000}
+        b.client.get_stock_name.side_effect = lambda code: code
+
+        b._apply_screened_stocks({"kr": self._stocks()}, tag="test")
+        self.assertEqual(b.kr_stocks, [])
+
 
 class SelectionMethodTests(unittest.TestCase):
     """종목 선택 방식 플러그블 — MC 외 momentum/trend/low_vol 점수가 의도대로 정렬."""
@@ -5123,6 +5350,128 @@ class SelectionMethodTests(unittest.TestCase):
         down, down_r = self._ret([170 - i for i in range(70)])    # 역배열(하락)
         self.assertGreater(AutoScreener._score_alt("trend", up, up_r),
                            AutoScreener._score_alt("trend", down, down_r))
+
+    def test_momentum_filter_handles_non_mc_rows_and_rejects_nonpositive(self):
+        """method=momentum은 mc=None인데 filter_top이 mc dict로 가정해 스크리닝이 죽던 회귀."""
+        from zusik.analysis.auto_screener import AutoScreener
+        s = AutoScreener()
+        rows = [
+            {"info": ("UP", "상승"), "mc": None, "method": "momentum",
+             "score": 0.12, "trend_ok": True, "last_price": 100},
+            {"info": ("FLAT", "횡보"), "mc": None, "method": "momentum",
+             "score": 0.0, "trend_ok": True, "last_price": 100},
+            {"info": ("DOWN", "하락"), "mc": None, "method": "momentum",
+             "score": -0.12, "trend_ok": True, "last_price": 100},
+        ]
+        self.assertEqual([r["info"][0] for r in s.filter_top(rows, 3)], ["UP"])
+
+
+class ReturnStructureRegressionTests(unittest.TestCase):
+    """저수익 집중 원인: 청산라벨 누수·과열 추격·무차별 잔금집행 회귀 방지."""
+
+    def _sizing_bot(self, config=None):
+        from zusik.core.bot import TradingBot
+        b = TradingBot.__new__(TradingBot)
+        b.config = config or {"entry_quality": {"enabled": True}}
+        b._adaptive_params = lambda: {"cap": 0.14, "whitelist_cap": 0.20}
+        b._is_whitelist = lambda symbol: False
+        return b
+
+    def test_entry_quality_blocks_extreme_rsi_and_allows_healthy_momentum(self):
+        b = self._sizing_bot()
+        extreme = make_ohlcv_df([100 + i for i in range(65)])
+        healthy = make_ohlcv_df([100 + i * 0.2 + (1 if i % 2 else -1) for i in range(65)])
+        ok, reason = b._entry_quality_gate(extreme)
+        self.assertFalse(ok)
+        self.assertIn("극단 과열", reason)
+        self.assertTrue(b._entry_quality_gate(healthy)[0])
+
+    def test_cash_deployment_boosts_only_excess_cash_high_confidence(self):
+        cfg = {"_cash_reserve": 0.05, "cash_deployment": {
+            "enabled": True, "target_cash_ratio": 0.05, "min_confidence": 0.65,
+            "full_boost_cash_ratio": 0.20, "max_size_boost": 1.5,
+        }}
+        b = self._sizing_bot(cfg)
+        boosted, reason = b._cash_deployment_ratio(0.06, 0.20, 0.80, "X")
+        self.assertAlmostEqual(boosted, 0.09)
+        self.assertIn("초과현금", reason)
+        self.assertEqual(b._cash_deployment_ratio(0.06, 0.20, 0.50, "X")[0], 0.06)
+        self.assertEqual(b._cash_deployment_ratio(0.06, 0.05, 0.80, "X")[0], 0.06)
+
+    def test_exit_context_never_becomes_buy_weight_or_prompt_evidence(self):
+        import zusik.core.reward_engine as reward_engine
+        from zusik.core.reward_engine import RewardEngine
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with patch.object(reward_engine, "REWARD_FILE", os.path.join(tmp.name, "reward.json")):
+            r = RewardEngine({"reward": {"context_learning_trades": 3}})
+            r._context_scores = {
+                "peace:long:rsi_overbought": {
+                    "trades": 37, "wins": 36, "total_pnl": 1_930_006,
+                    "ema_return": 2.8, "last_updated": "2026-08-13",
+                },
+                "peace:long:breakout": {
+                    "trades": 4, "wins": 3, "total_pnl": 40_000,
+                    "ema_return": 1.0, "last_updated": "2026-08-13",
+                },
+            }
+            self.assertEqual(r.get_context_weight("peace:long:rsi_overbought"), 1.0)
+            summary = r.get_performance_summary_text()
+            self.assertNotIn("rsi_overbought", summary)
+            self.assertIn("peace:long:breakout", summary)
+
+    def test_buy_context_is_read_back_from_entry_not_sell_pattern(self):
+        from zusik.storage.portfolio_tracker import PortfolioTracker
+        t = PortfolioTracker.__new__(PortfolioTracker)
+        t._trades = [{"type": "buy", "code": "X", "reason": "돌파 매수",
+                      "entry_context": "peace:long:breakout",
+                      "entry_indicators": {"RSI_14": 58},
+                      "entry_analyst_details": {"technical": {"signal": "BUY"}}},
+                     {"type": "sell", "code": "X", "sell_pattern": "rsi_overbought"}]
+        self.assertEqual(t.get_last_buy_context("X"), "peace:long:breakout")
+        self.assertEqual(t.get_last_buy_indicators("X")["RSI_14"], 58)
+        self.assertEqual(
+            t.get_last_buy_analyst_details("X")["technical"]["signal"], "BUY")
+
+    def test_legacy_sell_time_patterns_are_not_described_as_buy_conditions(self):
+        import zusik.core.reward_engine as reward_engine
+        from zusik.core.reward_engine import RewardEngine
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with patch.object(reward_engine, "REWARD_FILE", os.path.join(tmp.name, "reward.json")):
+            r = RewardEngine({"reward": {"learning_trades": 3}})
+            pattern = {"rsi": 85, "vol_ratio": 2.0, "ma_aligned": True,
+                       "bb_position": "상단", "realized_rate": 3.0}
+            r._win_patterns = [dict(pattern) for _ in range(3)]
+            self.assertIn("학습 데이터 부족", r.get_winning_conditions()["summary"])
+            r._win_patterns = [dict(pattern, source="entry") for _ in range(3)]
+            self.assertNotIn("학습 데이터 부족", r.get_winning_conditions()["summary"])
+
+    def test_allocation_advice_uses_excess_cash_for_us_transfer(self):
+        from zusik.reporting.status_snapshot import build_allocation_advice
+        a = build_allocation_advice({
+            "kr_cash": 3_000_000, "kr_eval": 22_000_000,
+            "us_cash_krw": 350_000, "us_eval_krw": 5_000_000,
+        }, {"_cash_reserve": 0.05,
+            "cash_deployment": {"target_cash_ratio": 0.05,
+                                "us_target_allocation": 0.30}})
+        self.assertGreater(a["recommended_transfer_krw"], 1_000_000)
+        self.assertLessEqual(a["recommended_transfer_krw"], a["deployable_cash_krw"])
+        cash_after = a["cash_krw"] - a["deployable_cash_krw"]
+        self.assertGreaterEqual(cash_after, int(a["total_assets"] * 0.05))
+
+    def test_allocation_snapshot_skips_incomplete_latest_balance(self):
+        from zusik.reporting.status_snapshot import latest_complete_allocation_snapshot
+        rows = [
+            {"date": "2026-08-13", "kr_cash": 3_000_000, "kr_eval": 22_000_000,
+             "us_cash_krw": 350_000, "us_eval_krw": 5_000_000,
+             "total_equity": 30_350_000},
+            {"date": "2026-08-14", "kr_cash": 0, "kr_eval": 0,
+             "us_cash_krw": 350_000, "us_eval_krw": 5_000_000,
+             "total_equity": 10_000_000},
+        ]
+        self.assertEqual(
+            latest_complete_allocation_snapshot(rows)["date"], "2026-08-13")
 
 
 class OpenGuardTests(unittest.TestCase):
@@ -6649,8 +6998,8 @@ class StabilityFeatureTests(unittest.TestCase):
             self.assertTrue(cc.ClaudeClient(prefer_cli=True, disable_agy=False)._has_agy)
             self.assertFalse(cc.ClaudeClient(prefer_cli=True, disable_agy=True)._has_agy)
 
-    def test_agy_used_in_easy_rotation(self):
-        """easy 티어 라우팅에 agy 가 후보로 들어가 호출된다 (gemini 대체)."""
+    def test_agy_used_as_easy_fallback(self):
+        """Codex가 없으면 easy 티어가 agy 폴백을 호출한다."""
         import zusik.clients.claude_client as cc
         c = cc.ClaudeClient.__new__(cc.ClaudeClient)
         c._has_agy, c._has_codex, c._has_claude, c._has_local = (
@@ -6658,8 +7007,7 @@ class StabilityFeatureTests(unittest.TestCase):
         c._try_local = lambda *a, **k: None
         c._run_agy = lambda prompt, *a, **k: "AGY_OK"
         with patch.object(cc, "_check_limit", lambda p: True), \
-             patch.object(cc, "_record_call", lambda p: None), \
-             patch.object(cc, "_next_rotation", lambda t: 0):
+             patch.object(cc, "_record_call", lambda p: None):
             self.assertEqual(c._call_easy("hi"), "AGY_OK")
 
     def test_healthcheck_probes_each_provider_dead_codex_bad(self):

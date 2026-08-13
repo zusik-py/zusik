@@ -635,6 +635,9 @@ class USTradingMixin:
         # 원인: RIOT 4/29 7회 buy→sell 루프 — 잔여 소진이 churn_guard를 거치지 않아 24시간 차단된 종목을 즉시 재매수
         #: 양의 모멘텀 요구(leftover_momentum_min) — 평평/식은 종목에 자투리 현금을 넣어
         #  죽은 자본이 되던 문제(MSFT peak +0.24% → -12.8%) 방지. 미달이면 현금을 그대로 둔다.
+        if not (self.config.get("cash_deployment", {}) or {}).get(
+                "allow_leftover_orders", True):
+            return
         try:
             # 장전 sentiment & defensive 게이트 통과해야 잔여 소진 매수도 허용
             analysis = self.strategy.get_last_analysis() if self.use_claude else None
@@ -818,6 +821,13 @@ class USTradingMixin:
         if self._churn_guard(ticker, name, df=df, price=price,
                              is_add_on=self.positions.is_pyramid_eligible(ticker, price)):
             return
+
+        _is_add_on = self.positions.is_pyramid_eligible(ticker, price)
+        quality_ok, quality_reason = self._entry_quality_gate(
+            df, is_inverse=self._is_inverse(ticker), is_add_on=_is_add_on)
+        if not quality_ok:
+            logger.info("US 진입 품질 차단 (%s): %s", name, quality_reason)
+            return
         # 장전 리포트 sentiment gate (인버스는 우회)
         if not self._is_inverse(ticker):
             analysis = self.strategy.get_last_analysis() if self.use_claude else None
@@ -865,8 +875,16 @@ class USTradingMixin:
                     self._pending_us_buy_usd = float(getattr(self, "_pending_us_buy_usd", 0.0)) + add_qty * price * 1.005
                     fx_now = self.client.get_usd_krw_rate()
                     self.positions.record_buy(ticker, name, add_qty, price)
-                    self.tracker.record_buy(ticker, name, add_qty, int(price * fx_now),
-                                            False, f"[US 피라미딩 {pyramid['level']}차] {pyramid['reason']}")
+                    self._record_buy_with_context(
+                        ticker, name, add_qty, int(price * fx_now), False,
+                        f"[US 피라미딩 {pyramid['level']}차] {pyramid['reason']}",
+                        entry_context=(self._last_entry_context(ticker)
+                                       or self._build_reward_context(
+                                           getattr(self, "_market_condition", "peace"),
+                                           self._is_inverse(ticker))),
+                        entry_indicators=self._last_entry_indicators(ticker),
+                        entry_analyst_details=self._last_entry_analyst_details(ticker),
+                    )
                     self.positions.record_pyramid(ticker, pyramid["level"])
                     if self.discord:
                         self.discord.notify_trade(
@@ -909,10 +927,18 @@ class USTradingMixin:
                 base_ratio, conf, is_inverse=self._is_inverse(ticker), symbol=ticker,
                 realized_vol=rvol,
             )
+            us_total = cash_usd + sum(
+                float(h.get("eval_amount", 0) or 0)
+                for h in us_balance.get("holdings", []))
+            cash_ratio = (cash_usd / us_total) if us_total > 0 else 0.0
+            adj_ratio, cash_reason = self._cash_deployment_ratio(
+                adj_ratio, cash_ratio, conf, symbol=ticker)
             invest = cash_usd * adj_ratio
             if abs(adj_ratio - base_ratio) > 0.01:
                 logger.info("US %s 투자비율 조정 %.3f → %.3f (%s)",
                             name, base_ratio, adj_ratio, adj_reason)
+            if "초과현금" in cash_reason:
+                logger.info("US %s 현금 집행 가속: %s", name, cash_reason)
 
         reward_context = self._build_reward_context(
             getattr(self, "_market_condition", "peace"),
@@ -977,7 +1003,13 @@ class USTradingMixin:
             fx_now = self.client.get_usd_krw_rate()
             price_krw = int(price * fx_now)
             self.positions.record_buy(ticker, name, qty, price)
-            self.tracker.record_buy(ticker, name, qty, price_krw, is_long_term, long_term_reason if is_long_term else reason)
+            self._record_buy_with_context(
+                ticker, name, qty, price_krw, is_long_term,
+                long_term_reason if is_long_term else reason,
+                entry_context=reward_context,
+                entry_indicators=(analysis or {}).get("indicators", {}),
+                entry_analyst_details=(analysis or {}).get("analyst_details", {}),
+            )
             if self.discord:
                 self.discord.notify_trade(
                     side="long_term_buy" if is_long_term else "buy",
@@ -1059,11 +1091,11 @@ class USTradingMixin:
                 strategy_name=_strategy_bucket,
                 realized_pnl=pnl["realized_pnl"],
                 realized_rate=pnl["realized_rate"],
-                context=self._build_reward_context(
-                    getattr(self, "_market_condition", "peace"),
-                    self._is_inverse(ticker),
-                    sell_pattern=self.tracker._classify_sell_pattern(reason) if hasattr(self.tracker, "_classify_sell_pattern") else "",
-                ),
+                indicators=self._last_entry_indicators(ticker),
+                context=(self._last_entry_context(ticker)
+                         or self._build_reward_context(
+                             getattr(self, "_market_condition", "peace"),
+                             self._is_inverse(ticker))),
             )
 
             if self.discord:
@@ -1195,7 +1227,7 @@ class USTradingMixin:
         if not self._check_risks_before_trading("US"):
             return
         if not self.us_stocks:
-            return
+            logger.warning("US 신규 진입 후보 없음 — 보유 종목 청산 관리만 계속")
 
         logger.info("===== US 매매 [%s] =====", datetime.now().strftime("%H:%M:%S"))
 
@@ -1224,18 +1256,23 @@ class USTradingMixin:
         force_bought_tickers = set()
         try:
             # 매수가능금액 별도 조회 (잔고 API가 외화예수금을 안 보여주는 버그 우회)
-            import requests
-            self.client._ensure_token()
-            headers = {
-                'authorization': f'Bearer {self.client._access_token}',
-                'appkey': self.client.app_key, 'appsecret': self.client.app_secret,
-                'content-type': 'application/json', 'tr_id': 'TTTS3007R',
-            }
-            params = {'CANO': self.client.account_no, 'ACNT_PRDT_CD': '01',
-                      'OVRS_EXCG_CD': 'NASD', 'OVRS_ORD_UNPR': '0', 'ITEM_CD': 'SOFI'}
-            r = requests.get(f'{self.client.base_url}/uapi/overseas-stock/v1/trading/inquire-psamount',
-                             headers=headers, params=params, timeout=10)
-            buying_power = float(r.json().get('output', {}).get('ord_psbl_frcr_amt', 0))
+            allow_forced = bool((self.config.get("cash_deployment", {}) or {}).get(
+                "allow_forced_orders", True))
+            buying_power = 0.0
+            if allow_forced:
+                import requests
+                self.client._ensure_token()
+                headers = {
+                    'authorization': f'Bearer {self.client._access_token}',
+                    'appkey': self.client.app_key, 'appsecret': self.client.app_secret,
+                    'content-type': 'application/json', 'tr_id': 'TTTS3007R',
+                }
+                params = {'CANO': self.client.account_no, 'ACNT_PRDT_CD': '01',
+                          'OVRS_EXCG_CD': 'NASD', 'OVRS_ORD_UNPR': '0', 'ITEM_CD': 'SOFI'}
+                r = requests.get(
+                    f'{self.client.base_url}/uapi/overseas-stock/v1/trading/inquire-psamount',
+                    headers=headers, params=params, timeout=10)
+                buying_power = float(r.json().get('output', {}).get('ord_psbl_frcr_amt', 0))
 
             if not us_bal.get("holdings") and buying_power > self.min_amount_usd:
                 logger.info("US 보유 0 + $%.2f 매수가능 → Claude 판단 후 매수", buying_power)
@@ -1398,4 +1435,3 @@ class USTradingMixin:
                     f.result(timeout=180)
                 except Exception:
                     pass
-

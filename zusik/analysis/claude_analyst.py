@@ -659,7 +659,8 @@ class ClaudeAnalyst:
 
             name_kr = self.analysts[role].name_kr
             pct = norm[role] * 100
-            all_reasoning.append(f"[{name_kr} {pct:.0f}%] {r.get('reasoning', '')}")
+            # '가중' 명시 — 이전 "[펀더멘털 47%]" 표기가 확신도로 오독되던 문제
+            all_reasoning.append(f"[{name_kr} 가중 {pct:.0f}%] {r.get('reasoning', '')}")
             if r.get("long_term_reason"):
                 long_term_reasons.append(f"[{name_kr}] {r['long_term_reason']}")
 
@@ -705,10 +706,15 @@ class ClaudeAnalyst:
         buy_count = sum(1 for s in signals if s in buy_signals)
         sell_count = sum(1 for s in signals if s == "sell")
 
-        # 만장일치 (n/n): +20%
-        if n >= 2 and (buy_count == n or sell_count == n):
+        # 만장일치 (n/n): n≥3이면 +20%, n=2는 +10% — quick 모드(2명)에서 2/2 만장일치가
+        # 상시 +20%p를 먹어 확신도를 부풀리던 문제(실측: 7일간 8회, 0.74→0.94 등).
+        # 표본 2개의 합의는 절반만 신뢰한다.
+        if n >= 3 and (buy_count == n or sell_count == n):
             weighted_confidence = min(1.0, weighted_confidence + 0.2)
             all_reasoning.append(f"[만장일치 +20% ({max(buy_count, sell_count)}/{n})]")
+        elif n == 2 and (buy_count == n or sell_count == n):
+            weighted_confidence = min(1.0, weighted_confidence + 0.1)
+            all_reasoning.append(f"[만장일치(2인) +10% ({max(buy_count, sell_count)}/{n})]")
         # 압도적 다수결 (n-1, 반대 0 — 나머지는 hold): +15%
         elif n >= 3 and buy_count >= n - 1 and sell_count == 0:
             weighted_confidence = min(1.0, weighted_confidence + 0.15)

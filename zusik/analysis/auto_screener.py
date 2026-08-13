@@ -1090,6 +1090,7 @@ class AutoScreener:
                     "code": code,
                     "info": cand,
                     "mc": mc,
+                    "method": method,
                     "score": score,
                     "trend_ok": trend_ok,
                     "last_price": float(close[-1]),
@@ -1144,10 +1145,14 @@ class AutoScreener:
                     return False
                 if not include_inverse:
                     return False
-            mc = r["mc"]
-            if mc["p_profit"] < self.min_p_profit and "인버스" not in (r["info"][1] if len(r["info"]) > 1 else ""):
-                return False
-            if mc["var95"] < self.min_var95:
+            mc = r.get("mc")
+            if mc is not None:
+                if mc["p_profit"] < self.min_p_profit and "인버스" not in (r["info"][1] if len(r["info"]) > 1 else ""):
+                    return False
+                if mc["var95"] < self.min_var95:
+                    return False
+            elif r.get("method") == "momentum" and float(r.get("score", 0)) <= 0:
+                # 모멘텀 모드에서 횡보/하락 후보로 현금을 소진하지 않는다.
                 return False
             return True
 

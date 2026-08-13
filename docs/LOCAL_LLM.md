@@ -1,7 +1,7 @@
 # 로컬 LLM 사용하기 (API 비용/쿼터 0)
 
-이 봇은 분석에 외부 LLM을 씁니다. 기본값은 구독한 CLI(`claude`/`codex`/`agy`(Antigravity)) 또는
-`ANTHROPIC_API_KEY` 입니다. API 비용과 쿼터 없이 자기 컴퓨터의 로컬 모델로 돌리고 싶다면,
+이 봇은 분석에 외부 LLM을 씁니다. 기본 provider는 Codex CLI이고, `claude`/`agy`(Antigravity)는
+폴백입니다. API 비용과 쿼터 없이 자기 컴퓨터의 로컬 모델로 돌리고 싶다면,
 이 문서대로 [Ollama](https://ollama.com) 를 붙이면 됩니다.
 
 > 운영자(CLI, API 구독자)는 설정할 필요가 없습니다. 기본값이 OFF(`local_enabled: false`)이므로
@@ -14,7 +14,7 @@
 `config.yaml: ai_providers.local_enabled: true` 로 켜면:
 
 - 저렴한 분석(센티멘트, 퀀트, 장전/장후 리포트): 로컬 모델을 우선 씁니다 (쿼터/비용 0).
-- 중요한 매매 판단(매수/매도 최종): Claude 가 있으면 Claude 우선, 없으면 로컬 폴백.
+- 중요한 매매 판단(매수/매도 최종): Codex 우선, 실패하면 다른 CLI와 로컬로 폴백.
 - 로컬 모델이 응답하지 않으면 자동으로 꺼지고 기존 CLI/API 로 폴백합니다(봇이 멈추지 않음).
 - `claude`/`codex`/`agy` 가 하나도 없어도 로컬만으로 분석이 돌아갑니다(로컬 전용 운용 가능).
 
@@ -138,7 +138,7 @@ ai_providers:
 
 - 통합 지점: `zusik/clients/claude_client.py`. 로컬은 새 provider 로 끼워져, 저렴 티어
   (`easy`/`medium`/`cheap_web`/`balanced`)는 로컬 우선, 중요 티어(`hard`/`premium`)는
-  Claude 우선, 없으면 로컬 폴백.
+  Codex 우선, 사용할 수 없으면 다른 CLI와 로컬로 폴백.
 - HTTP 호출: Ollama `POST /api/generate` (스트리밍 끔). CLI 가 아니라 `requests` 로 직접 호출.
 - 검색 주입: `use_web_search=True` 인 호출에서 `web_search()` 결과를 프롬프트 상단에 붙입니다.
 - 비용 집계 제외: 로컬 호출은 `data/api_costs.json` 의 일일 한도(total 캡)에 잡히지 않습니다.

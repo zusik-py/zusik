@@ -9,16 +9,20 @@ broker:
   # 본인 계정이 파생ETF 승인됐으면 config.local.yaml 에서 true 로(인버스 헷지 활성화).
   derivative_etf_enabled: false
 
-# CLI provider on/off (분석 속도 가속)
+# LLM provider 라우팅. Codex가 모든 티어의 기본이고, 한도/로그인/실패 때만 다른 provider로 폴백.
 ai_providers:
+  primary_provider: codex       # codex | agy | claude (기본: codex)
   disable_codex: false
+  codex_model: gpt-5.6-sol      # 최신 품질 우선 모델. 미지원/한도 시 아래 provider로 자동 폴백
+  codex_effort: low             # 자동매매 지연·사용량과 판단 품질의 균형
+  claude_effort: low            # 자동매매 JSON/리포트는 저지연 low; CLI 별칭은 최신 모델로 자동 추적
 
   # agy(Antigravity) — 구글 Gemini 계열 provider. `agy -p`(--print) 비대화형 모드로 봇이 호출.
-  # ~/.local/bin/agy + ~/.gemini 로그인 필요. claude/codex 와 부하를 나눠 claude 과부하를 던다.
+  # ~/.local/bin/agy + ~/.gemini 로그인 필요. Codex를 쓸 수 없을 때 폴백으로 사용한다.
   disable_agy: false
 
   # claude 일시정지 — 이 시각(KST 'YYYY-MM-DD HH:MM') 전까지 claude(Anthropic) 호출 0.
-  # 사용자 Claude(Max) 쿼터 보호용. 봇은 codex/agy/로컬 퀀트로만 매매. 시각 경과 시 자동 복귀
+  # Claude를 폴백에서도 잠시 빼고 싶을 때 사용. 봇은 codex/agy/로컬 퀀트로만 매매. 시각 경과 시 자동 복귀
   # (재시작 불요). 끄려면 빈 문자열("") 로. 매매 안전망(급락/트레일링/하드스톱)은 로컬이라 무관.
   claude_pause_until: ""
 
@@ -26,12 +30,12 @@ ai_providers:
   llm_health_alert: true
 
   # ── 로컬 LLM (Ollama) — API 비용/쿼터 0 ──
-  # API 대형 LLM(claude/codex/agy) 대신 자체 머신의 로컬 모델로 분석을 돌리고 싶은
+  # Codex 등 외부 LLM 대신 자체 머신의 로컬 모델로 분석을 돌리고 싶은
   # 사용자용. 기본 OFF — CLI 구독 운영자는 false 유지(영향 없음). 켜는 법: docs/LOCAL_LLM.md
   #   1) Ollama 설치 + `ollama pull qwen2.5:7b`
   #   2) local_enabled: true
   # 활성 시 저렴 티어(easy/medium/cheap_web/balanced)는 로컬을 우선 사용하고,
-  # 중요 판단(hard/premium)은 Claude 우선·로컬은 폴백. 로컬 무응답이면 자동 비활성.
+  # 중요 판단(hard/premium)은 Codex 우선·로컬은 폴백. 로컬 무응답이면 자동 비활성.
   local_enabled: false
   local_endpoint: "http://localhost:11434"   # Ollama HTTP 엔드포인트
   local_model: ""                             # 사용자가 환경에 맞게 직접 지정 (Ollama 에 받은 모델명). 비우면 비활성
@@ -40,7 +44,7 @@ ai_providers:
   local_search_results: 4                     # 주입할 검색 결과 개수
   local_timeout: 120                          # CPU 추론은 느림 — 초 단위 타임아웃
 
-# 균형 복구 (codex/agy 재로그인으로 부하 분산 회복 → AI 분석 정상화)
+# Codex 주 라우팅 + provider 폴백
 reports:
   # 효과 추적 baseline (hold-through·모델선택·whitelist 재설계 배포일).
   # 이 날짜 이후 신규 매도만으로 조기손절 비중↓·실현↑ 효과를 매 장마감 자동 리포트.
@@ -48,12 +52,11 @@ reports:
   pre_market_enabled: true    # 장전 리포트 — 매매 반영O: _pre_market_buy_gate가 sentiment로
                               # 신규 매수 차단/확신도 하한 적용 (whitelist 우회). 복구.
   daily_enabled: false        # 장후 일일 리포트 — 매매 반영X (순수 Discord 보고용, 소비처 0).
-                              # 가장 무거운 Claude 호출이라 비활성 유지 (실투자 영향 없음).
-  claude_screener_enabled: true   # Claude 종목 선별 (sonnet) — 후보 풀에 반영. 복구.
-                                  # auto_screener (MC + Vortex, Claude 미사용)와 병행
+                              # 무거운 LLM 호출이라 비활성 유지 (실투자 영향 없음).
+  claude_screener_enabled: true   # AI 종목 선별 — 키 이름은 기존 설정 호환을 위해 유지.
+                                  # auto_screener (MC + Vortex, LLM 미사용)와 병행
 
-# 분석 동시화 — 복구: 3개 CLI(claude/codex/agy) 분산 회복으로 1→3.
-# 동시 3종목 분석을 라운드로빈으로 분산 (원 기본값 4보다 약간 보수적).
+# 분석 동시화 — Codex 주 호출과 provider 폴백을 고려해 3개 워커 사용.
 analysis_max_workers: 3
 
 # 아레나(가상 전략 경쟁) — 장 마감 중엔 스킵. 복구: 60→30분.
@@ -68,11 +71,33 @@ arena:
 # 종목 선택 다양화/상황 적응 — RS 랭킹에 레짐·로테이션 틸트 적용.
 selection:
   regime_adaptive: true    # 하락장(bear score↑)엔 저변동(방어) 종목, 상승장엔 모멘텀 우선
+  min_relative_strength: -0.05  # 지수 대비 이 값보다 약하면 제외. 개인 공격 설정은 0.0 권장
   regime_bear_gate: 0.40   # bear score 이 이상이면 방어(저변동) 틸트 적용
   regime_vol_weight: 1.5   # 하락장 변동성 페널티 강도
   rotation: true           # 최근 매도 종목 디프리오리타이즈 — 같은 테마 쏠림 방지(로테이션)
   rotation_penalty: 0.03   # 로테이션 페널티 (RS %p 환산)
   event_boost: 0.05        # 이벤트 로테이션: 장전 리포트에서 감지한 활성 수혜 섹터 종목 부스트(RS %p)
+
+# 신규 진입 품질 — LLM이 청산 통계를 매수 근거로 오해해도 로컬에서 과열/무모멘텀 차단.
+entry_quality:
+  enabled: true
+  min_momentum: 0.08
+  hard_rsi_max: 82
+  breakout_required_rsi: 74
+  breakout_min_momentum: 0.25
+  breakout_min_volume_ratio: 1.2
+
+# 유휴현금 집행 — 신호 문턱을 낮추지 않고 고확신 정상 BUY의 크기만 가속.
+# 잔금소진 직접주문은 최근 60일 -446k원이라 기본 차단한다.
+cash_deployment:
+  enabled: true
+  target_cash_ratio: 0.05
+  min_confidence: 0.65
+  full_boost_cash_ratio: 0.20
+  max_size_boost: 1.50
+  allow_leftover_orders: false
+  allow_forced_orders: false    # 보유 0이라는 이유만으로 HOLD 후보에 전액 강제매수하지 않음
+  us_target_allocation: 0.30
 
 # 개장 급변동 대처: 개장 직후 시초 갭/스파이크 추격을 피하려 신규 매수 보류.
 # 헷지·추가매수(피라미딩)·빠른진입(확인된 신호)은 제외. 보유 청산은 40초 빠른 익절이 관리.
@@ -324,10 +349,11 @@ index_follow:
   min_kr_allocation: 0.30         # KR 인덱스 ETF 최소 비중 30%
   min_us_allocation: 0.30         # US 인덱스 ETF 최소 비중 30%
   rotation_cooldown_hours: 12     # 회전 후 12시간 쿨다운 (과회전 방지)
-ai_provider: claude
+# 레거시 호환 키. 신규 설정은 ai_providers.primary_provider를 사용한다.
+ai_provider: codex
 strategy:
   name: auto_hybrid
-  model: claude-sonnet-4-20250514
+  model: claude-sonnet-5
   use_web_search: true
   prefer_cli: true
   # 30→120. get_daily_long(250봉)을 받아도 _backtest_window가 backtest_days+워밍업
@@ -572,8 +598,8 @@ momentum_breakout:
 # ──────────────────────────────────────────────────────────────────
 # AI agent 사용량은 아래 3축으로 조절한다. 본인 구독/요금제에 맞춰 프리셋을 고른다:
 #
-#   ┌── provider 분산: 항상 claude+codex+agy 3-CLI (ai_providers.disable_codex=false).
-#   │     한 CLI 한도 도달 시 자동 폴백 → Claude 단일 쿼터 부하를 구조적으로 분산.
+#   ┌── provider 라우팅: Codex 우선, agy/Claude 폴백 (ai_providers.primary_provider=codex).
+#   │     Codex 한도·로그인·실패 시 자동 폴백 → 단일 provider 장애에도 분석 유지.
 #   ├── 웹검색: strategy.claude_websearch_full_only (false=quick까지 / true=full만 / use_web_search=false=끔)
 #   └── 일일 한도: api_cost.daily_limits (provider별 호출 상한 — 아래 프리셋)
 #
@@ -586,7 +612,7 @@ momentum_breakout:
 #   미지정 키는 cost_optimizer.DAILY_LIMITS 기본값을 유지하므로 바꿀 줄만 적어도 된다.
 # ══════════════════════════════════════════════════════════════════
 api_cost:
-  # Claude 비용 최적화: 어제 1500회 → 500회 목표
+  # Codex 주 사용 + Claude 폴백 한도
   daily_budget_calls: 500
   cache_ttl_calm: 90            # 30 → 90분 (변동 작으면 길게 캐시)
   cache_ttl_normal: 45          # 15 → 45분
@@ -597,9 +623,9 @@ api_cost:
   # 요금제 바꾸면 이 블록 숫자만 saver/balanced 값으로 교체하면 즉시 반영.
   daily_limits:
     claude_opus: 0
-    claude_sonnet: 120            # 사용량 절감(250→120) — Claude 호출 하드 캡
-    claude_haiku: 400             # 저가 보조도 하향(900→400) → 한도 도달 시 codex/로컬 폴백
-    codex: 1800
+    claude_sonnet: 120            # Codex 실패 시 고품질 폴백
+    claude_haiku: 400             # Codex/agy 실패 시 저가 폴백
+    codex: 1800                   # 모든 LLM 티어의 기본 provider
     agy: 250                      # Antigravity — 에이전트형(호출당 비쌈) 보수 캡
     total: 3000                   # 전 provider 합산 일일 백스톱(7500→3000)
 # AI 신호 매매 반영 — '유저에게만 보여주던' 크로스시그널(美→韓 익일)·데일리 Claude 편향을

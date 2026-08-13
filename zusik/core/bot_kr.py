@@ -70,6 +70,14 @@ class KRTradingMixin:
         if self._churn_guard(code, name, df=df, price=price,
                              is_add_on=self.positions.is_pyramid_eligible(code, price)):
             return
+
+        # 신규 진입 품질: 약한 모멘텀과 과열 추격은 LLM BUY라도 차단한다.
+        _is_add_on = self.positions.is_pyramid_eligible(code, price)
+        quality_ok, quality_reason = self._entry_quality_gate(
+            df, is_inverse=self._is_inverse(code), is_add_on=_is_add_on)
+        if not quality_ok:
+            logger.info("진입 품질 차단 (%s): %s", name, quality_reason)
+            return
         # churning 방지 — 같은 종목 매수 후 4시간 cooldown + 일 N회 한도
         #: 인버스 헷지(hedge_base_ratio)는 우회 — 급락 중 분할 증액(1·2·3차)을
         # 막으면 안 됨. 총 노출은 _inverse_under_max_ratio(20%)가 별도로 cap.
@@ -193,12 +201,17 @@ class KRTradingMixin:
                 base_ratio, conf, is_inverse=self._is_inverse(code), symbol=code,
                 realized_vol=rvol,
             )
+            cash_ratio = (float(cash) / float(total_asset)) if total_asset > 0 else 0.0
+            adj_ratio, cash_reason = self._cash_deployment_ratio(
+                adj_ratio, cash_ratio, conf, symbol=code)
             # cap을 자산 기준으로 환산: invest = total_asset × ratio (단 cash 한도 내)
             invest = int(total_asset * adj_ratio)
             invest = min(invest, int(cash))  # 가용 현금 한도
             if abs(adj_ratio - base_ratio) > 0.01:
                 logger.info("%s 투자비율 조정 %.3f → %.3f (%s)",
                             name, base_ratio, adj_ratio, adj_reason)
+            if "초과현금" in cash_reason:
+                logger.info("%s 현금 집행 가속: %s", name, cash_reason)
 
         # ── 실적 캘린더 체크 ──
         if news_text:
@@ -309,7 +322,15 @@ class KRTradingMixin:
                         if attempt < 2:
                             time.sleep(1 * (attempt + 1))
                 if result and result.get("success"):
-                    self.tracker.record_buy(code, name, qty, price, False, reason)
+                    self._record_buy_with_context(
+                        code, name, qty, price, False, reason,
+                        entry_context=(self._last_entry_context(code)
+                                       or self._build_reward_context(
+                                           getattr(self, "_market_condition", "peace"),
+                                           self._is_inverse(code))),
+                        entry_indicators=self._last_entry_indicators(code),
+                        entry_analyst_details=self._last_entry_analyst_details(code),
+                    )
                     self.positions.record_buy(code, name, qty, price)
                     self.positions.record_pyramid(code, pyramid["level"])
                     if self.discord:
@@ -385,7 +406,13 @@ class KRTradingMixin:
         self.order_guard.record_order(code, "buy", qty, price, result.get("order_no", ""))
         if result.get("success"):
             self.positions.record_buy(code, name, qty, price)
-            self.tracker.record_buy(code, name, qty, price, is_long_term, long_term_reason if is_long_term else reason)
+            self._record_buy_with_context(
+                code, name, qty, price, is_long_term,
+                long_term_reason if is_long_term else reason,
+                entry_context=reward_context,
+                entry_indicators=(analysis or {}).get("indicators", {}),
+                entry_analyst_details=(analysis or {}).get("analyst_details", {}),
+            )
 
             # Claude 기억에 매수 기록
             if self.use_claude:
@@ -472,15 +499,13 @@ class KRTradingMixin:
             self._record_sell_for_churn_guard(code, reason, sell_price=price)
 
             # 보상 엔진 + 애널리스트 성과 기록
-            indicators = None
-            analyst_details = None
-            if self.use_claude:
-                analysis = self.strategy.get_last_analysis()
-                indicators = analysis.get("indicators") if analysis else None
-                analyst_details = analysis.get("analyst_details") if analysis else None
+            # 매도 판단의 과매수 RSI/애널리스트 의견을 진입 성과로 학습하면 청산 신호가
+            # 다음 매수의 우승 패턴으로 뒤집힌다. 반드시 체결 때 보존한 진입 자료만 쓴다.
+            indicators = self._last_entry_indicators(code)
+            analyst_details = self._last_entry_analyst_details(code)
 
             # 수동 진입은 자동 전략의 산출물이 아니므로 별도 버킷으로 — 전략 EMA 오염 방지.
-            # (잔금소진/강제매수는 실측 +EV(leftover 45건 승률 69%)라 일반 학습 유지)
+            # 잔금소진/강제매수도 진입 사유는 별도 ROI로 관측하되 전략 버킷은 유지한다.
             _entry_reason = self.tracker.get_last_buy_reason(code)
             _strategy_bucket = "manual" if "수동" in _entry_reason else self.strategy.name
             self.reward.record_trade_result(
@@ -489,11 +514,12 @@ class KRTradingMixin:
                 realized_pnl=pnl["realized_pnl"],
                 realized_rate=pnl["realized_rate"],
                 indicators=indicators,
-                context=self._build_reward_context(
-                    getattr(self, "_market_condition", "peace"),
-                    self._is_inverse(code),
-                    sell_pattern=self.tracker._classify_sell_pattern(reason) if hasattr(self.tracker, "_classify_sell_pattern") else "",
-                ),
+                # 반드시 매수 때 저장한 진입 컨텍스트로 귀속한다. 매도 패턴을 넣으면
+                # rsi_overbought 익절 승률이 과매수 *매수* 승률로 역전파된다.
+                context=(self._last_entry_context(code)
+                         or self._build_reward_context(
+                             getattr(self, "_market_condition", "peace"),
+                             self._is_inverse(code))),
             )
 
             # 3인 애널리스트 성과 경쟁 기록
@@ -541,8 +567,7 @@ class KRTradingMixin:
             logger.warning("리스크 체크 실패 — KR 매매 중단")
             return
         if not self.kr_stocks:
-            logger.warning("KR 종목 없음")
-            return
+            logger.warning("KR 신규 진입 후보 없음 — 보유 종목 청산 관리만 계속")
 
         # 네트워크 체크 — 3회 실패 시 리셋 후 계속 (멈추지 않음)
         if self.network.should_pause():
@@ -554,7 +579,8 @@ class KRTradingMixin:
         # 핵심(whitelist) 코어 진입 — Claude 분석 대기 없이 사이클 맨 앞에서 먼저 매수.
         # 변동성 장에선 모든 종목이 claude_quick(순차·느림)을 타 삼성/하이닉스가 6번째라
         # 한참 뒤에야(또는 영영) 도달하던 문제 → 로컬 코어 패스로 즉시 목표까지 확보.
-        self._core_entry_pass_kr()
+        if self.kr_stocks:
+            self._core_entry_pass_kr()
 
         def _exec_safe(stock):
             try:
@@ -655,4 +681,3 @@ class KRTradingMixin:
                     f.result(timeout=180)
                 except Exception:
                     pass
-

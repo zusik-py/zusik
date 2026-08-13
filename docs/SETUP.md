@@ -11,7 +11,7 @@ zusik 을 처음부터 구동하기까지의 전체 절차입니다. 순서대�
 | Python | 3.8 이상 (3.8~3.13 CI 검증) |
 | OS | Linux / macOS / WSL (systemd 서비스는 Linux) |
 | 계정 | 한국투자증권(KIS) 계좌 + OpenAPI 신청 |
-| 선택 | Discord 봇, AI CLI(claude/codex/agy) 또는 Anthropic API 키, Upbit 키 |
+| 선택 | Discord 봇, Codex CLI(권장) 또는 폴백 AI CLI(claude/agy), Upbit 키 |
 
 > **윈도우 사용자**: 이 봇은 리눅스 환경에서 가장 잘 돌아갑니다. WSL(윈도우 안에서 리눅스를
 > 쓰게 해주는 기능)을 먼저 켜세요. **PowerShell** 을 관리자 권한으로 실행한 뒤 `wsl --install`
@@ -94,15 +94,15 @@ KIS_API_MATURE=false           # 계좌 개설 3일 경과 시 true
 
 ## 4. AI 분석 설정 (선택)
 
-LLM 분석을 사용하려면 둘 중 하나를 준비합니다. CLI 가 설치돼 있으면 자동 감지해 우선 쓰고,
-없으면 API 키로 폴백합니다.
+LLM 분석을 사용하려면 Codex CLI를 준비하는 것을 권장합니다. Codex가 모든 분석 티어의 기본이며,
+한도 도달·로그인 만료·응답 실패 때만 설치된 다른 provider로 자동 폴백합니다.
 
-- **CLI 방식 (권장)**: `claude` / `codex` / `agy`(Antigravity) 중 하나를 설치하면 자동 라우팅합니다.
-  여럿 설치하면 분산 처리되며, `setup.sh` 가 미설치 CLI 설치를 도와줍니다.
-- **API 방식**: `.env` 에 `ANTHROPIC_API_KEY=...` 추가
+- **Codex CLI (권장)**: `setup.sh`가 설치를 먼저 안내합니다. 설치 후 `codex login`을 한 번 실행하세요.
+- **폴백 (선택)**: `claude` / `agy`(Antigravity) 또는 로컬 LLM(Ollama)을 추가하면 Codex를
+  사용할 수 없을 때 분석을 이어갑니다. Claude CLI는 기본 설치 대상이 아닙니다.
 
 **요금제·개수에 맞춘 한도 설정**: 사람마다 요금제(Claude Pro/Max, Codex Plus/Pro 등)와 보유 CLI 개수가
-다릅니다. `setup.sh` 의 **AI 요금제 마법사**가 설치된 CLI 를 감지해 요금제를 묻고, 그에 맞는 하루 호출
+다릅니다. `setup.sh` 의 **AI 요금제 마법사**가 설치된 CLI를 감지해 요금제를 묻고, 그에 맞는 하루 호출
 한도(`api_cost.daily_limits`)와 안 쓰는 provider 차단(`ai_providers.disable_*`)을 `config.local.yaml` 에
 자동 설정합니다(쿼터/요금 보호). 프리셋·수동 설정법은 [CONFIGURATION.md §9.1](CONFIGURATION.md) 참고.
 

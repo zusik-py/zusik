@@ -9,6 +9,92 @@ CLI(--status)와 Rust 웹(/api/status)이 같은 한 소스를 쓴다. effective
 import os
 
 
+def latest_complete_allocation_snapshot(rows) -> dict | None:
+    """자산 버킷 합계가 총자산과 맞는 가장 최근 스냅샷을 고른다.
+
+    장 마감 뒤 KIS가 KR 잔고를 0으로 반환한 불완전 행을 그대로 쓰면 실제 원화
+    예탁금이 사라진 것으로 오판한다. 결제 시차의 작은 차이는 허용하되 20% 넘는
+    불일치는 제외한다.
+    """
+    if not isinstance(rows, list):
+        return None
+    ordered = sorted(
+        (r for r in rows if isinstance(r, dict)),
+        key=lambda r: str(r.get("date", "")), reverse=True,
+    )
+    for row in ordered:
+        bucket_total = sum(max(0, int(row.get(k, 0) or 0)) for k in (
+            "kr_cash", "kr_eval", "us_cash_krw", "us_eval_krw"))
+        stated_total = int(row.get("total_equity", row.get("total", 0)) or 0)
+        if bucket_total <= 0:
+            continue
+        if stated_total > 0 and abs(bucket_total - stated_total) / stated_total > 0.20:
+            continue
+        return row
+    return None
+
+
+def build_allocation_advice(latest: dict | None, config: dict | None = None) -> dict:
+    """KR/US 예탁 버킷과 유휴현금에서 실행 가능한 이체·집행 권고를 계산한다.
+
+    경제적 지역노출이 아니라 실제 주문 가능 계좌 버킷 기준이다. 원화→달러 이체는
+    총 현금을 바꾸지 않으므로, 5% 현금예약을 남긴 범위에서만 권고한다.
+    """
+    row = latest or {}
+    cfg = (config or {}).get("cash_deployment", {}) or {}
+    kr_cash = max(0, int(row.get("kr_cash", 0) or 0))
+    kr_eval = max(0, int(row.get("kr_eval", 0) or 0))
+    us_cash = max(0, int(row.get("us_cash_krw", 0) or 0))
+    us_eval = max(0, int(row.get("us_eval_krw", 0) or 0))
+    total = kr_cash + kr_eval + us_cash + us_eval
+    target_cash_ratio = float(cfg.get(
+        "target_cash_ratio", (config or {}).get("_cash_reserve", 0.05)))
+    target_us_ratio = float(cfg.get("us_target_allocation", 0.30))
+    total_cash = kr_cash + us_cash
+    target_cash = int(total * target_cash_ratio)
+    deployable_cash = max(0, total_cash - target_cash)
+    direct_us = us_cash + us_eval
+    us_gap = max(0, int(total * target_us_ratio) - direct_us)
+
+    # 달러 예수금도 통합 현금예약의 일부다. 그 잔액을 제외하고 KR에 남겨야 할
+    # 최소 원화현금만 보존한 뒤 이체 가능액을 계산한다.
+    kr_reserve_needed = max(0, target_cash - us_cash)
+    transferable = max(0, kr_cash - kr_reserve_needed)
+    transfer_krw = min(us_gap, transferable)
+    return {
+        "total_assets": total,
+        "cash_krw": total_cash,
+        "cash_ratio": round(total_cash / total, 4) if total else 0.0,
+        "target_cash_ratio": target_cash_ratio,
+        "deployable_cash_krw": deployable_cash,
+        "direct_us_krw": direct_us,
+        "direct_us_ratio": round(direct_us / total, 4) if total else 0.0,
+        "target_us_ratio": target_us_ratio,
+        "us_gap_krw": us_gap,
+        "recommended_transfer_krw": transfer_krw,
+    }
+
+
+def render_allocation_advice(advice: dict) -> str:
+    """장전 리포트/상태 화면 공용 한 줄 권고."""
+    a = advice or {}
+    transfer = int(a.get("recommended_transfer_krw", 0) or 0)
+    deployable = int(a.get("deployable_cash_krw", 0) or 0)
+    if transfer >= 100_000:
+        return (
+            f"자금배분 권고: 직접 US 비중 {a.get('direct_us_ratio', 0):.0%} "
+            f"(목표 {a.get('target_us_ratio', 0):.0%}). KR 예탁금에서 "
+            f"약 {transfer:,}원을 US로 이체하고, 고품질 신호에 분할 투자 "
+            f"(현재 집행 가능 초과현금 {deployable:,}원)."
+        )
+    if deployable >= 100_000:
+        return (
+            f"현금집행 권고: 예약현금 {a.get('target_cash_ratio', 0):.0%}를 제외한 "
+            f"{deployable:,}원을 고품질 신호에 분할 투자."
+        )
+    return "자금배분: 현금예약·KR/US 목표 범위 안."
+
+
 def _tail_lines(path: str, n: int) -> list:
     try:
         if not os.path.exists(path):
@@ -28,8 +114,7 @@ def build_status_snapshot(bot, generated_at: str = "") -> dict:
     try:
         from zusik.storage.portfolio_tracker import EQUITY_CURVE_FILE, _load_json
         curve = _load_json(EQUITY_CURVE_FILE)
-        if isinstance(curve, list) and curve:
-            latest = max(curve, key=lambda c: c.get("date", ""), default=None)
+        latest = latest_complete_allocation_snapshot(curve)
     except Exception:
         pass
     try:
@@ -42,6 +127,12 @@ def build_status_snapshot(bot, generated_at: str = "") -> dict:
     except Exception:
         snap["equity"] = {}
         snap["by_stock"] = []
+
+    # 1b) 유휴현금과 KR→US 이체 권고 (equity_curve 로컬 데이터만, 주문/API 없음)
+    try:
+        snap["allocation"] = build_allocation_advice(latest, cfg)
+    except Exception:
+        snap["allocation"] = {}
 
     # 2) 보유 현황 (positions.json — API 호출 없음)
     try:
@@ -151,6 +242,9 @@ def render_status_text(snap: dict) -> str:
                  f"수익률 {eq.get('return_pct', 0):+.2f}%  MaxDD {eq.get('max_drawdown', 0):+.2f}%")
         L.append(f" 실현 {eq.get('realized_total', 0):>+12,}  미실현 {eq.get('unrealized', 0):>+12,}  "
                  f"승률 {eq.get('win_rate', 0)}% ({eq.get('sells', 0)}매도)")
+    alloc = s.get("allocation", {}) or {}
+    if alloc:
+        L.append(" " + render_allocation_advice(alloc))
     L.append(f" 시장: KR {'개장' if mk.get('kr_open') else '마감'} · US {'개장' if mk.get('us_open') else '마감'}"
              f"   국면 {st.get('market_condition', '?')}  모드 {st.get('mode', '?')}")
     flags = []

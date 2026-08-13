@@ -63,7 +63,7 @@ class ReportingMixin:
                     kr_cash = bal.get("cash", 0)
                     kr_holdings = bal.get("holdings", [])
                 except Exception:
-                    kr_cash, kr_holdings = 0, []
+                    bal, kr_cash, kr_holdings = {}, 0, []
                 try:
                     us_bal = self.client.get_us_balance()
                     us_cash = us_bal.get("cash_usd", 0.0)             # settled (매수 가능)
@@ -72,7 +72,45 @@ class ReportingMixin:
                     us_pending = us_bal.get("sell_pending_usd", 0.0)
                     us_holdings = us_bal.get("holdings", [])
                 except Exception:
+                    us_bal = {}
                     us_cash, us_cash_display, us_pending, us_holdings = 0.0, 0.0, 0.0, []
+
+                allocation_note = ""
+                if market == "US":
+                    try:
+                        fx = float(self.client.get_usd_krw_rate() or 0)
+                        us_eval_usd = float(us_bal.get("us_eval_usd", 0) or 0)
+                        if us_eval_usd <= 0:
+                            us_eval_usd = sum(
+                                float(h.get("eval_amount", 0) or 0) for h in us_holdings)
+                        from zusik.reporting.status_snapshot import (
+                            build_allocation_advice, latest_complete_allocation_snapshot,
+                            render_allocation_advice,
+                        )
+                        allocation_row = {
+                            "kr_cash": kr_cash,
+                            "kr_eval": int(bal.get("total_eval", 0) or 0),
+                            "us_cash_krw": int(us_cash * fx),
+                            "us_eval_krw": int(us_eval_usd * fx),
+                        }
+                        # 장 마감 후 KR API가 현금·평가액을 모두 0으로 주는 경우가 있다.
+                        # 로컬 포지션에 KR 종목이 남아 있으면 마지막 완전 스냅샷으로 계산한다.
+                        tracked = getattr(self.positions, "_positions", {}) or {}
+                        has_kr_position = any(
+                            str(code).isdigit() and (pos.get("qty", 0) or 0) > 0
+                            for code, pos in tracked.items() if isinstance(pos, dict)
+                        )
+                        if has_kr_position and not (
+                                allocation_row["kr_cash"] or allocation_row["kr_eval"]):
+                            from zusik.storage.portfolio_tracker import EQUITY_CURVE_FILE, _load_json
+                            fallback = latest_complete_allocation_snapshot(
+                                _load_json(EQUITY_CURVE_FILE))
+                            if fallback:
+                                allocation_row = fallback
+                        allocation_note = render_allocation_advice(
+                            build_allocation_advice(allocation_row, self.config))
+                    except Exception:
+                        logger.debug("US 자금배분 권고 계산 실패", exc_info=True)
 
                 def _affordable_kr():
                     """미보유 && 현금으로 1주 살 수 있는 KR 종목만 반환."""
@@ -159,6 +197,8 @@ class ReportingMixin:
                 report = cl.message(prompt, use_web_search=True, tier="cheap_web")
 
                 if report and len(report) > 50:
+                    if allocation_note:
+                        report = f"{report}\n\n💵 {allocation_note}"
                     async def _send():
                         ch = _discord_bot_ref._alert_channel
                         await ch.send(f"**{title}**")
@@ -954,4 +994,3 @@ BIAS_JSON={{"kr": {{"종목코드": "buy|hold|reduce|sell"}}, "us": {{"티커": 
                 if a.get("long_term_reason"):
                     logger.info("  장기사유: %s", a["long_term_reason"])
             time.sleep(1)
-
