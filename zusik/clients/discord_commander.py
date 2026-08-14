@@ -382,8 +382,11 @@ class DiscordCommander:
             qty = amount // price
             if qty <= 0:
                 return f"금액 부족: {amount:,}원으로 {price:,}원 종목 매수 불가"
-            result = self.bot.client.buy_market(code, qty)
+            result = self.bot._submit_kr_market_buy(code, qty, price)
             if result.get("success"):
+                qty = self.bot._submitted_order_qty(result, qty)
+                if qty <= 0:
+                    return "매수 실패: 성공 응답에 실제 전송 수량 없음"
                 # 수동 주문도 봇 회계에 기록 — 없으면 포지션 보호(본전/트레일링)와
                 # 실현손익·패턴 통계가 이 보유를 모르거나 추정치로 어긋남
                 self._record_manual_buy(code, name, qty, price)

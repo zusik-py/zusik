@@ -53,8 +53,7 @@ reports:
                               # 신규 매수 차단/확신도 하한 적용 (whitelist 포함). 복구.
   daily_enabled: false        # 장후 일일 리포트 — 매매 반영X (순수 Discord 보고용, 소비처 0).
                               # 무거운 LLM 호출이라 비활성 유지 (실투자 영향 없음).
-  claude_screener_enabled: true   # AI 종목 선별 — 키 이름은 기존 설정 호환을 위해 유지.
-                                  # auto_screener (MC + Vortex, LLM 미사용)와 병행
+  claude_screener_enabled: false  # 호환 키. 감시목록은 screening.authority 한 곳만 갱신.
 
 # 분석 동시화 — Codex 주 호출과 provider 폴백을 고려해 3개 워커 사용.
 analysis_max_workers: 3
@@ -168,6 +167,14 @@ adaptive:
       rsi_exit_profit_min: 0.05
 screening:
   enabled: true
+  # 단일 권위: auto(로컬 모멘텀) 또는 llm. 두 선별기가 같은 목록을 번갈아 덮어쓰지 않는다.
+  authority: auto
+  # 장중에는 감시목록 고정. 새 결과는 대기시켰다가 폐장 후 다음 세션 목록으로 적용한다.
+  session_lock_enabled: true
+  # 기존 강세 종목보다 점수가 의미 있게 높은 신규 종목만 제한적으로 교체한다.
+  stability_gate_enabled: true
+  min_score_improvement: 0.02
+  max_replacements_per_update: 3
   # 종목 선택 방식 — momentum(기본) | monte_carlo(MC 부트스트랩) | trend(추세 정배열) | low_vol(저변동 방어).
   # MC 외 방식은 시뮬 없이 빨라 상황별로 골라 쓸 수 있다(예: 하락장 low_vol, 강세장 momentum).
   method: momentum
@@ -423,6 +430,14 @@ risk:
   daily_loss_limit_pct: 0.03
   strategy_switch_loss: -0.1
   crisis_drop_threshold: -0.05
+  # 선별 방식과 MC 실행 게이트의 역할 분리. momentum/trend 선별에서는 MC를 꼬리위험
+  # 안전망으로만 쓰고, screening.method=monte_carlo일 때만 55% 엄격 문턱을 적용한다.
+  mc_buy_gate:
+    enabled: true
+    min_p_profit: 0.40
+    min_var95: -0.18
+    strict_min_p_profit: 0.55
+    strict_min_var95: -0.15
   stop_loss_per_stock: -0.15
   daily_loss_limit: -15000
   # 조기손절 억제 (KR/US 공통). 비핵심 보유가 이 손익률보다 얕은 pullback이면

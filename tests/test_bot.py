@@ -1010,6 +1010,7 @@ class TradingBotRuntimeTests(unittest.TestCase):
             screen_us_stocks=Mock(return_value=[]),
         )
         self.bot.reward.get_performance_summary_text.return_value = ""
+        self.bot.config.setdefault("screening", {})["authority"] = "llm"
         self.bot._apply_screened_stocks = self.bot_cls._apply_screened_stocks.__get__(self.bot, self.bot_cls)
 
         # market="both"로 명시해 시장 열림 상태에 관계없이 실행
@@ -5236,7 +5237,8 @@ class RegimeSelectionTests(unittest.TestCase):
         b = TradingBot.__new__(TradingBot)
         b.config = {"selection": {"regime_adaptive": True, "regime_bear_gate": 0.40,
                                   "regime_vol_weight": 1.5, "rotation": rotation,
-                                  "rotation_penalty": 0.03}}
+                                  "rotation_penalty": 0.03},
+                    "screening": {"session_lock_enabled": False}}
         b.period = "D"
         b._RS_DROP_THRESHOLD = -0.05
         b._reentry_block = recently_sold or {}
@@ -5367,6 +5369,162 @@ class RegimeSelectionTests(unittest.TestCase):
         result = b._apply_screened_stocks.call_args.args[0]
         self.assertEqual([s["code"] for s in result["kr"]], ["STRONG", "WEAK"])
         self.assertEqual(b._apply_screened_stocks.call_args.kwargs["tag"], "자동 스크리닝")
+
+
+class KISBuyingPowerTests(unittest.TestCase):
+    """KIS 종목별 현금매수 가능수량 계약 — 실주문 없이 응답/감량만 검증."""
+
+    @staticmethod
+    def _client():
+        from zusik.clients.kis_client import KISClient
+        c = KISClient.__new__(KISClient)
+        c.is_virtual = False
+        c.account_no = "12345678"
+        c.account_prod = "01"
+        c._buying_power_cache = {}
+        return c
+
+    def test_uses_target_symbol_price_and_no_credit_fields(self):
+        c = self._client()
+        captured = {}
+
+        def fake_get(path, tr_id, params):
+            captured.update(path=path, tr_id=tr_id, params=dict(params))
+            return {"output": {"nrcvb_buy_amt": "745000", "nrcvb_buy_qty": "3"}}
+
+        c._get = fake_get
+        info = c.get_orderable_buy_info("018260", 244_000, force=True)
+        self.assertEqual(captured["params"]["PDNO"], "018260")
+        self.assertEqual(captured["params"]["ORD_UNPR"], "244000")
+        self.assertEqual(captured["params"]["ORD_DVSN"], "01")
+        self.assertEqual(info["cash"], 745_000)
+        self.assertEqual(info["max_qty"], 3)
+
+    def test_buy_market_clamps_to_kis_max_qty(self):
+        c = self._client()
+        c.get_orderable_buy_info = Mock(return_value={
+            "cash": 500_000, "max_qty": 2, "reference_price": 100_000,
+        })
+        c._order = Mock(return_value={"success": True, "message": "OK", "order_no": "1"})
+        result = c.buy_market("005930", 5, reference_price=100_000)
+        self.assertEqual(c._order.call_args.args[2], 2)
+        self.assertEqual(result["requested_qty"], 5)
+        self.assertEqual(result["submitted_qty"], 2)
+
+    def test_buy_market_fails_closed_when_preflight_unavailable(self):
+        c = self._client()
+        c.get_orderable_buy_info = Mock(side_effect=RuntimeError("rate limit"))
+        c._order = Mock()
+        result = c.buy_market("005930", 5, reference_price=100_000)
+        self.assertFalse(result["success"])
+        self.assertTrue(result["blocked"])
+        self.assertEqual(result["submitted_qty"], 0)
+        c._order.assert_not_called()
+
+    def test_insufficient_cash_requeries_and_retries_smaller_once(self):
+        c = self._client()
+        c.get_orderable_buy_info = Mock(side_effect=[
+            {"cash": 500_000, "max_qty": 3, "reference_price": 100_000},
+            {"cash": 300_000, "max_qty": 2, "reference_price": 100_000},
+        ])
+        c._order = Mock(side_effect=[
+            {"success": False, "message": "주문가능금액을 초과 했습니다", "order_no": ""},
+            {"success": True, "message": "OK", "order_no": "2"},
+        ])
+        result = c.buy_market("005930", 3, reference_price=100_000)
+        self.assertEqual(c._order.call_count, 2)
+        self.assertEqual(c._order.call_args_list[1].args[2], 2)
+        self.assertEqual(result["submitted_qty"], 2)
+
+    def test_balance_buy_cash_is_zero_when_psbl_order_fails(self):
+        c = self._client()
+
+        def fake_get(path, tr_id, params):
+            if path.endswith("inquire-balance"):
+                return {
+                    "output1": [{"hldg_qty": "1", "pdno": "005930",
+                                 "prdt_name": "삼성전자", "pchs_avg_pric": "100000",
+                                 "prpr": "100000", "evlu_amt": "100000",
+                                 "evlu_pfls_amt": "0", "evlu_pfls_rt": "0"}],
+                    "output2": [{"dnca_tot_amt": "3000000", "nxdy_excc_amt": "0",
+                                 "prvs_rcdl_excc_amt": "0", "scts_evlu_amt": "100000",
+                                 "evlu_pfls_smtl_amt": "0", "tot_evlu_pfls_rt": "0"}],
+                }
+            raise RuntimeError("psbl unavailable")
+
+        c._get = fake_get
+        balance = c._fetch_balance_uncached()
+        self.assertEqual(balance["cash"], 0)
+        self.assertFalse(balance["cash_verified"])
+        self.assertEqual(balance["deposit_cash"], 3_000_000)
+        self.assertEqual(balance["total_cash"], 3_000_000)
+
+
+class ScreeningStabilityTests(unittest.TestCase):
+    def _bot(self):
+        from zusik.core.bot import TradingBot
+        b = TradingBot.__new__(TradingBot)
+        b.config = {"screening": {
+            "authority": "auto", "session_lock_enabled": True,
+            "stability_gate_enabled": True, "kr_count": 2,
+            "min_score_improvement": 0.02, "max_replacements_per_update": 1,
+        }}
+        b.kr_stocks = [{"code": "A"}, {"code": "B"}]
+        b.us_stocks = []
+        b.stocks = b.kr_stocks
+        b.auto_screen = True
+        b.screener = Mock()
+        b.client = Mock()
+        return b
+
+    def test_auto_authority_prevents_llm_list_rewrite(self):
+        b = self._bot()
+        b._refresh_stocks(force=True, market="both")
+        b.screener.screen_kr_stocks.assert_not_called()
+        b.screener.screen_us_stocks.assert_not_called()
+
+    def test_open_session_stages_instead_of_replacing(self):
+        b = self._bot()
+        b.client.is_market_open.return_value = True
+        b.client.is_us_market_open.return_value = False
+        b._apply_screened_stocks({"kr": [{"code": "C"}]}, tag="test")
+        self.assertEqual([s["code"] for s in b.kr_stocks], ["A", "B"])
+        self.assertEqual(b._pending_screened_results["kr"][0]["code"], "C")
+
+    def test_only_meaningful_score_gain_replaces_old_candidate(self):
+        b = self._bot()
+        scores = {"A": 0.10, "B": 0.09, "C": 0.10, "D": 0.15}
+
+        def rank(stocks, market):
+            out = []
+            for stock in stocks:
+                item = dict(stock)
+                item["_selection_score"] = scores[item["code"]]
+                out.append(item)
+            return sorted(out, key=lambda s: -s["_selection_score"])
+
+        b._rank_by_relative_strength = rank
+        unchanged = b._stable_ranked_selection(b.kr_stocks, [{"code": "C"}], "KR")
+        self.assertEqual({s["code"] for s in unchanged}, {"A", "B"})
+        replaced = b._stable_ranked_selection(b.kr_stocks, [{"code": "D"}], "KR")
+        self.assertEqual({s["code"] for s in replaced}, {"A", "D"})
+
+
+class MCGateConfigTests(unittest.TestCase):
+    def test_momentum_mode_uses_mc_as_tail_risk_guard(self):
+        from zusik.core.bot import TradingBot
+        b = TradingBot.__new__(TradingBot)
+        b.config = {"screening": {"method": "momentum"}, "risk": {"mc_buy_gate": {
+            "enabled": True, "min_p_profit": 0.40, "min_var95": -0.18,
+            "strict_min_p_profit": 0.55, "strict_min_var95": -0.15,
+        }}}
+        b._is_inverse = lambda code: False
+        b._compute_mc_stats = lambda df: {
+            "p_profit": 0.45, "mean_profit": 0.001, "var95": -0.16,
+        }
+        self.assertTrue(b._mc_buy_gate("005930", "삼성전자", [0] * 30)[0])
+        b.config["screening"]["method"] = "monte_carlo"
+        self.assertFalse(b._mc_buy_gate("005930", "삼성전자", [0] * 30)[0])
 
 
 class SelectionMethodTests(unittest.TestCase):
@@ -7843,6 +8001,9 @@ def run_runtime_unittests():
     suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(FastExitScanTests))
     suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(MultiMessengerTests))
     suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(RegimeSelectionTests))
+    suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(KISBuyingPowerTests))
+    suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(ScreeningStabilityTests))
+    suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(MCGateConfigTests))
     suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(SelectionMethodTests))
     suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(OpenGuardTests))
     suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(FastEntryTests))

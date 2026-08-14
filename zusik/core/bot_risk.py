@@ -524,7 +524,8 @@ class RiskExitMixin:
                 result = self.screener.screen_defensive(
                     self.kr_stocks, self.us_stocks, crisis_reason=reason,
                 )
-                self._apply_screened_stocks(result, tag="방어 종목 긴급 교체")
+                # 위기 방어 전환은 장중 목록 고정보다 우선한다. 일반 성과 선별만 세션 락 대상.
+                self._apply_screened_stocks(result, tag="방어 종목 긴급 교체", force=True)
 
         # 긴급 홀딩 해제 조건: 최근 2일 양봉이면 해제
         if was_emergency and df is not None and len(df) >= 3:
@@ -1107,4 +1108,3 @@ class RiskExitMixin:
                     logger.warning("정정 실패 %s: %s", code, res.get("message", ""))
             except Exception as e:
                 logger.warning("정정 예외 %s: %s", code, str(e)[:120])
-

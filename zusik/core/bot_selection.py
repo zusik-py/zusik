@@ -11,6 +11,107 @@ logger = logging.getLogger(__name__)
 class SelectionMixin:
     """SelectionMixin -- bot.py에서 분리된 관심사 묶음 (TradingBot의 베이스)."""
 
+    @staticmethod
+    def _screen_symbol(stock: dict, market: str) -> str:
+        return stock.get("code", "") if market == "KR" else stock.get("ticker", "")
+
+    def _screening_authority(self) -> str:
+        """감시목록을 실제로 바꿀 단일 선별기 이름."""
+        authority = str((self.config.get("screening", {}) or {}).get(
+            "authority", "auto"
+        )).strip().lower()
+        return authority if authority in ("auto", "llm", "hybrid") else "auto"
+
+    def _screen_session_locked(self, market: str) -> bool:
+        """장중 감시목록 교체를 막아 한 세션 동안 진입 유니버스를 고정한다."""
+        cfg = self.config.get("screening", {}) or {}
+        if not cfg.get("session_lock_enabled", True):
+            return False
+        try:
+            return (bool(self.client.is_market_open()) if market == "KR"
+                    else bool(self.client.is_us_market_open()))
+        except Exception:
+            return True  # 장 상태를 모르면 목록 변경보다 안정성 우선
+
+    def _apply_pending_screened_if_unlocked(self) -> None:
+        """장중 대기시킨 결과를 해당 시장 폐장 후 다음 세션용으로 적용한다."""
+        pending = getattr(self, "_pending_screened_results", {}) or {}
+        if not pending:
+            return
+        ready = {}
+        for market, key in (("KR", "kr"), ("US", "us")):
+            if pending.get(key) and not self._screen_session_locked(market):
+                ready[key] = pending.pop(key)
+        self._pending_screened_results = pending
+        if ready:
+            self._apply_screened_stocks(ready, tag="세션 대기 선별 적용", force=True)
+
+    def _stable_ranked_selection(self, current: list[dict], proposed: list[dict],
+                                 market: str) -> list[dict]:
+        """기존 강세 후보를 유지하고 의미 있게 우수한 신규 후보만 제한 교체한다."""
+        cfg = self.config.get("screening", {}) or {}
+        if not cfg.get("stability_gate_enabled", True):
+            return self._rank_by_relative_strength(proposed, market)
+
+        by_symbol = {}
+        # 신규 메타(reason/screen_score)를 우선하되 기존 종목도 함께 재평가한다.
+        for stock in current:
+            sym = self._screen_symbol(stock, market)
+            if sym:
+                by_symbol[sym] = dict(stock)
+        proposed_symbols = set()
+        for stock in proposed:
+            sym = self._screen_symbol(stock, market)
+            if sym:
+                proposed_symbols.add(sym)
+                merged = dict(by_symbol.get(sym, {}))
+                merged.update(stock)
+                by_symbol[sym] = merged
+
+        ranked = self._rank_by_relative_strength(list(by_symbol.values()), market)
+        if not ranked:
+            return []
+        target_key = "kr_count" if market == "KR" else "us_count"
+        target = max(1, int(cfg.get(target_key, len(proposed) or len(current) or 1)))
+        max_replacements = max(0, int(cfg.get("max_replacements_per_update", 3)))
+        min_gain = float(cfg.get("min_score_improvement", 0.02))
+        old_symbols = {self._screen_symbol(s, market) for s in current}
+
+        eligible_old = [s for s in ranked if self._screen_symbol(s, market) in old_symbols]
+        selected = eligible_old[:target]
+        selected_symbols = {self._screen_symbol(s, market) for s in selected}
+        newcomers = [
+            s for s in ranked
+            if self._screen_symbol(s, market) in proposed_symbols
+            and self._screen_symbol(s, market) not in selected_symbols
+        ]
+
+        # RS 게이트를 통과한 기존 후보가 부족하면 빈 슬롯은 즉시 채운다.
+        while newcomers and len(selected) < target:
+            item = newcomers.pop(0)
+            selected.append(item)
+            selected_symbols.add(self._screen_symbol(item, market))
+
+        replacements = 0
+        while newcomers and selected and replacements < max_replacements:
+            best_new = newcomers[0]
+            worst_old = min(selected, key=lambda s: float(s.get("_selection_score", -999)))
+            new_score = float(best_new.get("_selection_score", -999))
+            old_score = float(worst_old.get("_selection_score", -999))
+            if new_score < old_score + min_gain:
+                break
+            newcomers.pop(0)
+            selected.remove(worst_old)
+            selected.append(best_new)
+            replacements += 1
+
+        order = {self._screen_symbol(s, market): i for i, s in enumerate(ranked)}
+        selected.sort(key=lambda s: order.get(self._screen_symbol(s, market), 10**9))
+        if replacements:
+            logger.info("%s 감시목록 안정화: 점수 +%.3f 이상 신규만 %d종 교체",
+                        market, min_gain, replacements)
+        return selected
+
     def _load_stocks(self):
         """저장된 선별 결과가 있으면 로드, 없으면 config 기본값."""
         if self.screener and self.auto_screen:
@@ -40,6 +141,9 @@ class SelectionMixin:
             알림이 장 닫힌 시간에 날아가던 버그 방지
         """
         if not self.screener or not self.auto_screen:
+            return
+        if self._screening_authority() not in ("llm", "hybrid"):
+            logger.debug("LLM 종목 선별 스킵 — 단일 권위=%s", self._screening_authority())
             return
         if not force and not self.screener.needs_update():
             return
@@ -122,7 +226,7 @@ class SelectionMixin:
                 result["us"] = self.screener.screen_us_stocks(
                     self.us_stocks, performance_summary=perf, max_price_usd=max_usd,
                 )
-            self._apply_screened_stocks(result, tag="종목 선별")
+            self._apply_screened_stocks(result, tag="종목 선별", force=force)
 
             #: 분기 호출(screen_kr/us_stocks)은 selected_stocks.json의
             # last_updated를 갱신하지 않아 needs_update가 매번 True → 2분마다
@@ -148,8 +252,22 @@ class SelectionMixin:
         except Exception:
             return True  # 조회 실패 시 일단 통과
 
-    def _apply_screened_stocks(self, result: dict, tag: str = "종목 교체"):
+    def _apply_screened_stocks(self, result: dict, tag: str = "종목 교체",
+                               force: bool = False):
         """선별 결과를 실제 종목 리스트에 적용 (가격 필터 포함)."""
+        result = dict(result or {})
+        if not force:
+            pending = getattr(self, "_pending_screened_results", {}) or {}
+            for market, key in (("KR", "kr"), ("US", "us")):
+                if result.get(key) and self._screen_session_locked(market):
+                    pending[key] = list(result[key])
+                    result.pop(key, None)
+                    logger.info("%s %s 결과 대기 — 장중 감시목록 고정, 폐장 후 적용",
+                                tag, market)
+            self._pending_screened_results = pending
+        if not result:
+            return
+
         old_kr = {s.get("code", s.get("ticker", "")) for s in self.kr_stocks}
         old_us = {s.get("ticker", "") for s in self.us_stocks}
 
@@ -168,11 +286,12 @@ class SelectionMixin:
             pass
 
         if result.get("kr") and getattr(self, "kr_enabled", True):
-            # RS 게이트: 지수 대비 식은 후보 제거 + 강한 순 정렬
-            self.kr_stocks = self._rank_by_relative_strength(
+            self.kr_stocks = self._stable_ranked_selection(
+                self.kr_stocks,
                 self._filter_derivatives(result["kr"], market="KR"), "KR")
         if result.get("us") and getattr(self, "us_enabled", True):
-            self.us_stocks = self._rank_by_relative_strength(
+            self.us_stocks = self._stable_ranked_selection(
+                self.us_stocks,
                 self._filter_derivatives(result["us"], market="US"), "US")
         self.stocks = self.kr_stocks
 
@@ -804,8 +923,12 @@ class SelectionMixin:
                             s_qty = remaining // s_price
                             logger.info("잔금 소진: %s %d주 × %s원 매수 (모멘텀 %+.2f)",
                                         sn, s_qty, f"{s_price:,}", mom)
-                            result = self.client.buy_market(sc, s_qty)
+                            result = self._submit_kr_market_buy(sc, s_qty, s_price)
                             if result.get("success"):
+                                s_qty = self._submitted_order_qty(result, s_qty)
+                                if s_qty <= 0:
+                                    logger.warning("잔금 소진 성공 응답에 실제 수량 없음: %s", sn)
+                                    break
                                 # 포지션 상태 기록 — 없으면 본전보호/트레일링이 이 보유를 모름
                                 self.positions.record_buy(sc, sn, s_qty, s_price)
                                 self.tracker.record_buy(sc, sn, s_qty, s_price, False, "잔금 소진 매수")
@@ -971,7 +1094,14 @@ class SelectionMixin:
                 if event_sectors and event_boost and (
                         self.signals.sectors_of(sym, s.get("name", "")) & event_sectors):
                     score += event_boost   # 활성 이벤트 수혜 섹터 → 부스트(이벤트 로테이션)
-                scored.append((score, s))
+                ranked_stock = dict(s)
+                ranked_stock["_relative_strength"] = rs
+                # 자동 스크리너 점수와 RS를 함께 반영하되, 서로 다른 척도가 목록을
+                # 뒤집지 않도록 RS를 주축으로 작은 보너스만 준다.
+                screen_score = float(ranked_stock.get("screen_score", 0.0) or 0.0)
+                score += max(-0.02, min(0.02, screen_score * 0.02))
+                ranked_stock["_selection_score"] = score
+                scored.append((score, ranked_stock))
             scored.sort(key=lambda x: -x[0])
             ranked = [s for _, s in scored] + exempt
             if scored:
@@ -1210,6 +1340,10 @@ class SelectionMixin:
           3. 상위 N과 whitelist를 후보로 구성
           4. 동일한 상대강도 게이트를 거쳐 실제 감시 목록 갱신 + 디스코드 알림
         """
+        self._apply_pending_screened_if_unlocked()
+        if self._screening_authority() not in ("auto", "hybrid"):
+            return
+
         #: 일 1회 → 시간 간격(auto_screen_interval_hours, 기본 4h)으로.
         # 감시종목이 하루종일 고정돼 시장 변동을 반영 못 하던 문제 — 이제 N시간마다 현재
         # MC/모멘텀으로 후보 풀을 재랭킹해 watch list가 시장 흐름을 따라간다.
@@ -1330,7 +1464,8 @@ class SelectionMixin:
                 # 최종 적용은 _apply_screened_stocks에서 가격/파생/상대강도 게이트를 공통 적용.
                 screened_result = {}
                 if kr_top:
-                    kr_list = [{"code": r["info"][0], "name": r["info"][1]} for r in kr_top]
+                    kr_list = [{"code": r["info"][0], "name": r["info"][1],
+                                "screen_score": float(r.get("score", 0.0))} for r in kr_top]
                     kr_list = self._filter_derivatives(kr_list, market="KR")
                     # blacklist 강제 제외 (사용자 구매 금지 종목)
                     bl_kr = set(screen_cfg.get("blacklist_kr", []) or [])
@@ -1353,7 +1488,8 @@ class SelectionMixin:
                     screened_result["kr"] = kr_list
                 if us_top:
                     us_list = [{"ticker": r["info"][0], "name": r["info"][1],
-                                "exchange": r["info"][2]} for r in us_top]
+                                "exchange": r["info"][2],
+                                "screen_score": float(r.get("score", 0.0))} for r in us_top]
                     us_list = self._filter_derivatives(us_list, market="US")
                     wl_us = screen_cfg.get("whitelist_us", []) or []
                     existing_us = {s["ticker"] for s in us_list}

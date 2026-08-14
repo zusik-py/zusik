@@ -503,13 +503,29 @@ class CoreHelpersMixin:
         """MC 매수 게이트. 결과는 self._last_mc_stats에 캐시."""
         if df is None or len(df) < 30 or self._is_inverse(code):
             return True, "인버스/데이터 부족 — 우회"
+        gate_cfg = (self.config.get("risk", {}) or {}).get("mc_buy_gate", {}) or {}
+        if not gate_cfg.get("enabled", True):
+            return True, "MC 게이트 비활성"
         mc = self._compute_mc_stats(df)
         self._last_mc_stats = mc
         from zusik.analysis.bot_money_helpers import mc_buy_gate_decision
-        ok, reason = mc_buy_gate_decision(mc, min_p_profit=0.55, min_var95=-0.15)
+        # 모멘텀/추세 선별 뒤 동일 후보를 MC 55%로 다시 전부 거르는 이중 문턱을 제거한다.
+        # 스크리너 자체가 MC일 때만 엄격 문턱을 유지하고, 그 외 방식은 극단적 음의 기대값과
+        # 꼬리위험만 차단하는 안전망으로 사용한다.
+        method = str((self.config.get("screening", {}) or {}).get(
+            "method", "momentum"
+        )).strip().lower()
+        strict = method == "monte_carlo"
+        p_key = "strict_min_p_profit" if strict else "min_p_profit"
+        v_key = "strict_min_var95" if strict else "min_var95"
+        min_p = float(gate_cfg.get(p_key, 0.55 if strict else 0.40))
+        min_var = float(gate_cfg.get(v_key, -0.15 if strict else -0.18))
+        ok, reason = mc_buy_gate_decision(mc, min_p_profit=min_p, min_var95=min_var)
         if ok and mc:
-            logger.debug("MC OK %s: P(profit>0)=%.0f%%, VaR95=%+.1f%%, %.0fms",
-                         name, mc["p_profit"] * 100, mc["var95"] * 100, mc.get("elapsed_ms", 0))
+            logger.debug("MC OK %s: P(profit>0)=%.0f%% (하한 %.0f%%), "
+                         "VaR95=%+.1f%% (하한 %+.0f%%), %.0fms",
+                         name, mc["p_profit"] * 100, min_p * 100,
+                         mc["var95"] * 100, min_var * 100, mc.get("elapsed_ms", 0))
         return ok, reason
 
     def _apply_hysteresis(self, code: str, signal: str, conf: float) -> tuple[str, str]:
@@ -925,11 +941,15 @@ class CoreHelpersMixin:
         logger.info("핵심주 코어 타깃 탑업: %s 보유 %s < 목표 %s → %d주 매수 (장중 %+.1f%%)",
                     name, f"{int(held_val):,}", f"{int(target):,}", qty, intraday_change * 100)
         try:
-            res = self.client.buy_market(code, qty)
+            res = self._submit_kr_market_buy(code, qty, int(price))
         except Exception as e:
             logger.warning("핵심주 코어 탑업 매수 실패 %s: %s", name, str(e)[:120])
             return False
         if not res or not res.get("success"):
+            return False
+        qty = self._submitted_order_qty(res, qty)
+        if qty <= 0:
+            logger.warning("핵심주 코어 탑업 성공 응답에 실제 수량 없음: %s", name)
             return False
         self.positions.record_buy(code, name, qty, int(price))
         self.tracker.record_buy(code, name, qty, int(price), False, "핵심주 코어 타깃 매수")
@@ -1407,3 +1427,22 @@ class CoreHelpersMixin:
         else:
             curve.append(snap)
         _save_json(EQUITY_CURVE_FILE, curve)
+    def _submit_kr_market_buy(self, code: str, qty: int, reference_price: int) -> dict:
+        """브로커별 인터페이스를 보존하며 KR 시장가 매수를 전송한다.
+
+        KIS는 종목별 ``nrcvb_buy_qty`` 사전조회에 기준가격이 필요하므로 전달한다.
+        Toss/Fake 등 기존 브로커는 2-인자 계약을 그대로 사용한다.
+        """
+        if hasattr(self.client, "get_orderable_buy_info"):
+            return self.client.buy_market(code, qty, reference_price=reference_price)
+        return self.client.buy_market(code, qty)
+
+    @staticmethod
+    def _submitted_order_qty(result: dict | None, requested_qty: int) -> int:
+        """브로커가 주문가능수량에 맞춰 감액한 실제 전송 수량."""
+        if not result or not result.get("success"):
+            return 0
+        try:
+            return int(result.get("submitted_qty", requested_qty) or 0)
+        except (TypeError, ValueError):
+            return 0

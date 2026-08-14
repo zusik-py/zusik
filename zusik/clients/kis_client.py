@@ -57,6 +57,7 @@ class KISClient:
         from zusik.core.resilience import OrderSafetyValidator
         self._order_safety = OrderSafetyValidator()
         self._last_order_ts: dict = {}   # code -> (side, ts) — 워시트레이딩 검증용
+        self._buying_power_cache: dict = {}
 
     # ── 인증 ──
 
@@ -474,6 +475,8 @@ class KISClient:
             self._balance_cache = {}
         if hasattr(self, "_us_balance_cache"):
             self._us_balance_cache = {}
+        if hasattr(self, "_buying_power_cache"):
+            self._buying_power_cache = {}
 
     def get_balance(self) -> dict:
         """계좌 잔고 조회 (5초 TTL 캐시).
@@ -543,12 +546,24 @@ class KISClient:
         if isinstance(summary, list):
             summary = summary[0] if summary else {}
 
-        # 주문가능금액 별도 조회 (dnca_tot_amt는 주문 후 즉시 반영 안 됨)
-        orderable_cash = int(summary.get("dnca_tot_amt", 0))
+        # 주문가능금액 별도 조회. KIS 공식 명세상 현금 주문은
+        # nrcvb_buy_amt(미수없는매수금액)를 사용해야 한다. dnca_tot_amt는 예수금이며
+        # 종목 증거금률/미체결 주문을 반영한 실제 매수가능금액이 아니므로 매수 게이트에
+        # 사용하지 않는다. 조회 실패 시 0으로 fail-closed하고 총자산에는 예수금을 보존한다.
+        deposit_cash = int(summary.get("dnca_tot_amt", 0) or 0)
+        orderable_cash = 0
+        cash_verified = False
         try:
-            orderable_cash = self._get_orderable_cash()
-        except Exception:
-            pass  # 실패 시 기존 값 사용
+            if holdings:
+                ref_code = holdings[0]["code"]
+                ref_price = int(holdings[0].get("current_price", 0) or 0)
+            else:
+                ref_code = "005930"
+                ref_price = int(self.get_current_price(ref_code).get("price", 0) or 0)
+            orderable_cash = self._get_orderable_cash(ref_code, ref_price)
+            cash_verified = True
+        except Exception as e:
+            logger.warning("KR 주문가능금액 조회 실패 → 신규 매수 fail-closed: %s", str(e)[:120])
 
         # 미정산 매도 대금 (T+2 결제 대기) — 진짜 총자산 계산용
         # dnca_tot_amt: 즉시 가용 (D+0)
@@ -558,10 +573,12 @@ class KISClient:
         d2_cash = int(summary.get("prvs_rcdl_excc_amt", 0) or 0)
         # 진짜 총 cash = max(즉시 + 미정산)
         # prvs_rcdl_excc_amt가 D+2 결제 후 잔고이므로 가장 정확
-        total_cash = max(orderable_cash, d2_cash, nxdy_cash)
+        total_cash = max(deposit_cash, d2_cash, nxdy_cash)
 
         return {
             "cash": orderable_cash,           # 매수 게이트용 (즉시 가용)
+            "cash_verified": cash_verified,   # False면 매수 금지, 표시/자산은 total_cash 사용
+            "deposit_cash": deposit_cash,     # 단순 예수금(주문가능금액과 다를 수 있음)
             "total_cash": total_cash,         # equity 계산용 (미정산 포함)
             "nxdy_cash": nxdy_cash,           # D+1 결제 예정
             "d2_cash": d2_cash,               # D+2 결제 예정
@@ -571,24 +588,68 @@ class KISClient:
             "holdings": holdings,
         }
 
-    def _get_orderable_cash(self) -> int:
-        """주문가능현금 조회 (매수 후 즉시 반영)."""
+    _BUYING_POWER_TTL_SEC = 2
+
+    def get_orderable_buy_info(self, stock_code: str, reference_price: int,
+                               *, force: bool = False) -> dict:
+        """종목별 현금 매수가능금액/수량을 조회한다.
+
+        KIS ``inquire-psbl-order`` 명세에 따라 미수 없는 현금 주문은
+        ``nrcvb_buy_amt``/``nrcvb_buy_qty``를 사용한다. 특히 가능 수량은 실제 주문과
+        동일한 시장가(``ORD_DVSN=01``) 조건으로 조회해 종목 증거금률을 반영한다.
+        응답 필드가 없거나 조회가 실패하면 호출자에게 예외를 전달해 매수를 fail-closed한다.
+        """
+        code = str(stock_code or "").strip()
+        if not (code.isdigit() and len(code) == 6):
+            raise ValueError(f"잘못된 KR 종목코드: {stock_code!r}")
+        price = int(reference_price or 0)
+        if price <= 0:
+            price = int(self.get_current_price(code).get("price", 0) or 0)
+        if price <= 0:
+            raise ValueError(f"{code} 매수가능조회 기준가격 없음")
+
+        now = time.time()
+        cache = getattr(self, "_buying_power_cache", {}) or {}
+        cached = cache.get(code)
+        if (not force and cached
+                and now - float(cached.get("ts", 0)) < self._BUYING_POWER_TTL_SEC
+                and abs(int(cached.get("reference_price", 0)) - price)
+                <= max(1, int(price * 0.01))):
+            return dict(cached["data"])
+
         tr_id = "VTTC8908R" if self.is_virtual else "TTTC8908R"
         params = {
             "CANO": self.account_no,
             "ACNT_PRDT_CD": self.account_prod,
-            "PDNO": "005930",  # 아무 종목 (필수 파라미터)
-            "ORD_UNPR": "0",
+            "PDNO": code,
+            "ORD_UNPR": str(price),
             "ORD_DVSN": "01",  # 시장가
-            "CMA_EVLU_AMT_ICLD_YN": "Y",
+            "CMA_EVLU_AMT_ICLD_YN": "N",
             "OVRS_ICLD_YN": "N",
         }
         data = self._get(
             "/uapi/domestic-stock/v1/trading/inquire-psbl-order", tr_id, params
         )
         output = data.get("output", {})
-        # ord_psbl_cash: 주문가능현금
-        return int(output.get("ord_psbl_cash", 0))
+        if "nrcvb_buy_amt" not in output or "nrcvb_buy_qty" not in output:
+            raise RuntimeError("KIS 매수가능조회 응답에 nrcvb 필드 없음")
+        info = {
+            "cash": int(float(output.get("nrcvb_buy_amt", 0) or 0)),
+            "max_qty": int(float(output.get("nrcvb_buy_qty", 0) or 0)),
+            "reference_price": price,
+            "stock_code": code,
+        }
+        if not hasattr(self, "_buying_power_cache"):
+            self._buying_power_cache = {}
+        self._buying_power_cache[code] = {
+            "ts": now, "reference_price": price, "data": dict(info),
+        }
+        return info
+
+    def _get_orderable_cash(self, stock_code: str = "005930",
+                            reference_price: int = 0) -> int:
+        """미수 없는 실제 주문가능현금 조회(잔고 계약 호환용)."""
+        return int(self.get_orderable_buy_info(stock_code, reference_price)["cash"])
 
     # ── 주문 가격 정합화 (호가단위) ──
     # 키움 ch8 예제 `get_tick_size`/`get_order_price` 그대로 적용.
@@ -630,20 +691,81 @@ class KISClient:
 
     # ── 주문 ──
 
-    def buy_market(self, stock_code: str, qty: int) -> dict:
+    def buy_market(self, stock_code: str, qty: int, reference_price: int = 0) -> dict:
         """시장가 매수.
 
         Args:
             stock_code: 종목코드
             qty: 매수 수량
         """
-        return self._order(stock_code, "buy", qty, price=0, order_type="01")
+        requested_qty = int(qty) if isinstance(qty, int) and not isinstance(qty, bool) else qty
+        try:
+            info = self.get_orderable_buy_info(stock_code, reference_price)
+        except Exception as e:
+            logger.warning("매수 사전 차단 (%s): 종목별 주문가능수량 조회 실패 — %s",
+                           stock_code, str(e)[:120])
+            return {
+                "success": False,
+                "message": f"주문가능수량 조회 실패: {e}",
+                "order_no": "",
+                "blocked": True,
+                "requested_qty": requested_qty,
+                "submitted_qty": 0,
+            }
+
+        max_qty = int(info.get("max_qty", 0) or 0)
+        if (not isinstance(requested_qty, int) or isinstance(requested_qty, bool)
+                or requested_qty <= 0 or max_qty <= 0):
+            return {
+                "success": False,
+                "message": f"종목별 주문가능수량 0주 (요청 {requested_qty}주)",
+                "order_no": "",
+                "blocked": True,
+                "requested_qty": requested_qty,
+                "submitted_qty": 0,
+            }
+        submitted_qty = min(requested_qty, max_qty)
+        if submitted_qty < requested_qty:
+            logger.info("매수 수량 자동 감액: %s %d주 → %d주 (KIS 현금매수 가능수량)",
+                        stock_code, requested_qty, submitted_qty)
+
+        result = self._order(
+            stock_code, "buy", submitted_qty, price=0, order_type="01",
+            buy_preflight=info, market_price=int(info.get("reference_price", 0) or 0),
+        )
+
+        # 조회 직후에도 미체결 주문/증거금 변동으로 거절될 수 있다. 같은 수량을 반복하지 않고
+        # 주문가능수량을 강제 재조회한 뒤 더 작은 수량으로 단 한 번만 재시도한다.
+        if (not result.get("success")
+                and "주문가능금액" in str(result.get("message", ""))
+                and submitted_qty > 1):
+            try:
+                if hasattr(self, "_buying_power_cache"):
+                    self._buying_power_cache.pop(stock_code, None)
+                fresh = self.get_orderable_buy_info(stock_code, reference_price, force=True)
+                retry_qty = min(submitted_qty - 1, int(fresh.get("max_qty", 0) or 0))
+                if retry_qty > 0:
+                    logger.info("주문가능금액 거절 후 감량 재시도: %s %d주 → %d주",
+                                stock_code, submitted_qty, retry_qty)
+                    result = self._order(
+                        stock_code, "buy", retry_qty, price=0, order_type="01",
+                        buy_preflight=fresh,
+                        market_price=int(fresh.get("reference_price", 0) or 0),
+                    )
+                    submitted_qty = retry_qty
+            except Exception as e:
+                logger.warning("주문가능금액 거절 후 재조회 실패 (%s): %s", stock_code, str(e)[:120])
+
+        result["requested_qty"] = requested_qty
+        result["submitted_qty"] = submitted_qty if result.get("success") else 0
+        return result
 
     def sell_market(self, stock_code: str, qty: int) -> dict:
         """시장가 매도."""
         return self._order(stock_code, "sell", qty, price=0, order_type="01")
 
-    def _order(self, stock_code: str, side: str, qty: int, price: int, order_type: str) -> dict:
+    def _order(self, stock_code: str, side: str, qty: int, price: int, order_type: str,
+               buy_preflight: dict | None = None, market_price: int = 0) -> dict:
         """주문 실행.
 
         order_type: "00"=지정가, "01"=시장가
@@ -677,7 +799,7 @@ class KISClient:
         if stock_code.isdigit() and len(stock_code) == 6:
             try:
                 bal_pre = self.get_balance()
-                orderable_cash = bal_pre.get("cash")
+                orderable_cash = (buy_preflight or {}).get("cash", bal_pre.get("cash"))
                 held_qty = 0
                 for h in bal_pre.get("holdings", []):
                     if h.get("code") == stock_code:
@@ -689,7 +811,7 @@ class KISClient:
 
         # ── 주문 관문 안전 검증 (변조/조작 방어) — fail-closed, 전송 직전 ──
         # 지정가만 가격 밴드 검증용 시장가 조회 (시장가 주문은 추가 API 호출 없음)
-        market_price = 0.0
+        market_price = float(market_price or 0)
         if order_type == "00" and price and price > 0:
             try:
                 market_price = float(self.get_current_price(stock_code).get("price", 0) or 0)

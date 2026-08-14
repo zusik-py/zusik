@@ -313,7 +313,7 @@ class KRTradingMixin:
                 result = None
                 for attempt in range(3):
                     try:
-                        result = self.client.buy_market(code, qty)
+                        result = self._submit_kr_market_buy(code, qty, price)
                         self.network.record_success()
                         break
                     except Exception as e:
@@ -322,6 +322,10 @@ class KRTradingMixin:
                         if attempt < 2:
                             time.sleep(1 * (attempt + 1))
                 if result and result.get("success"):
+                    qty = self._submitted_order_qty(result, qty)
+                    if qty <= 0:
+                        logger.error("피라미딩 주문 성공 응답에 실제 수량 없음: %s", name)
+                        return
                     self._record_buy_with_context(
                         code, name, qty, price, False, reason,
                         entry_context=(self._last_entry_context(code)
@@ -368,7 +372,14 @@ class KRTradingMixin:
                 skip_dip_check=skip_dip,
             )
             if buy_plan.get("skip_reason"):
-                logger.info("분할매수: %s", buy_plan["skip_reason"])
+                key = (datetime.now().strftime("%Y-%m-%d"), code, buy_plan["skip_reason"])
+                seen = getattr(self, "_buy_skip_logged", set())
+                if key not in seen:
+                    logger.info("매수 미실행 (%s): %s", name, buy_plan["skip_reason"])
+                    seen.add(key)
+                    self._buy_skip_logged = seen
+                else:
+                    logger.debug("매수 미실행 반복 (%s): %s", name, buy_plan["skip_reason"])
                 return
             if buy_plan["qty"] <= 0:
                 return
@@ -390,7 +401,7 @@ class KRTradingMixin:
         result = None
         for attempt in range(3):
             try:
-                result = self.client.buy_market(code, qty)
+                result = self._submit_kr_market_buy(code, qty, price)
                 self.network.record_success()
                 break
             except Exception as e:
@@ -401,6 +412,11 @@ class KRTradingMixin:
 
         if not result or not result.get("success"):
             logger.error("매수 최종 실패: %s %d주 — %s", name, qty, result.get("message", "") if result else "응답 없음")
+            return
+
+        qty = self._submitted_order_qty(result, qty)
+        if qty <= 0:
+            logger.error("매수 성공 응답에 실제 전송 수량 없음: %s", name)
             return
 
         self.order_guard.record_order(code, "buy", qty, price, result.get("order_no", ""))
