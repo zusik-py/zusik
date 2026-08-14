@@ -2,7 +2,7 @@
   "count": 104,
   "files": {
     "config.yaml": "670a062bcf1a4da2af385fca1128b5001c7d15b6312257494cdcd3d8ad504088",
-    "main.py": "1340914e9578860da1d9f774d526ca4094bc25341df28864b1a231be66fba50e",
+    "main.py": "fe06aa25b0a7d2529274d391805770c0fdd7d8b0288ef5dc5a0521e4091d4891",
     "scripts/ambiguous_review.py": "bd06f9cf40640067952d3f85fcb56c1c02cc0958e268979e0393ed0e8ce8852b",
     "scripts/backtest_profit_mechanisms.py": "e3d3d1494915e999ab7f9dcf4ce9573c195231239c9834dce7f95db7862d3716",
     "scripts/calibrate_from_history.py": "6ed21eee0614dd486d61d2d603cde2169e143815d65a58218ba5f7de9421508d",
@@ -20,7 +20,7 @@
     "scripts/verify_profit.py": "285db7222cea620e3366b3e0215bd0848339dd1482c5c1b295b883db2f255025",
     "scripts/watchdog.py": "f2deedc58286f995f33ce231a24dab1885190f84dde73f074285c4c7efd5e601",
     "security_lock.py": "1abadd8ac1b81cc3c4cb610a15b918917ff88091a6066ae7e41f507cb6e05b02",
-    "tests/test_bot.py": "09e13a0372b98df2f137d0e422433285bd6e66a1c2db346950b47be9b57f5ae4",
+    "tests/test_bot.py": "c3c11a8c4dde0522f4a724775ff44efa878a072177fd97050d151dd98f6e146d",
     "tests/test_claude_analyst_judge.py": "55297c28cd02abf8df5d4e53c1affee71dfcecc81ddffa11600e77c7972c7f1c",
     "tests/test_claude_analyst_parse.py": "2c719cded4c1cd85cd9d4e44b83ad3cb143507157b7afc924ddc91d9a4b1538d",
     "tests/test_claude_analyst_support.py": "4f5f3db50e0c98340cc3da6c15515eda15426227faeefd39a001e7a249426637",

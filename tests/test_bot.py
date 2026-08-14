@@ -5850,6 +5850,15 @@ class SecurityHardeningTests(unittest.TestCase):
     검증 없는 정정·암호화폐 주문)이 재도입되면 실패한다.
     """
 
+    def test_main_loads_dotenv_before_zusik_imports(self):
+        """수동 main.py 실행도 import 시점의 Discord 소유자 권한을 놓치지 않는다."""
+        main_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "main.py"))
+        with open(main_path, encoding="utf-8") as f:
+            source = f.read()
+        dotenv_call = source.index("load_dotenv(_env_path, override=True)")
+        first_zusik_import = source.index("from zusik.")
+        self.assertLess(dotenv_call, first_zusik_import)
+
     def test_eval_adaptive_trigger_safe(self):
         from zusik.core.bot_helpers import eval_adaptive_trigger as ev
         self.assertTrue(ev("default", 0.0, 0.0))

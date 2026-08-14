@@ -14,6 +14,10 @@ import sys
 
 from dotenv import load_dotenv
 
+# Discord 명령 권한처럼 모듈 import 시 읽는 값이 있으므로 Zusik import보다 먼저 로드한다.
+_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+load_dotenv(_env_path, override=True)
+
 from zusik.core.bot import TradingBot, load_config
 from zusik.clients.discord_notifier import DiscordNotifier
 from zusik.utils.logger import setup_logger
@@ -32,10 +36,6 @@ def main():
     parser.add_argument("--notify", action="store_true",
                         help="--healthcheck 결과 요약을 메신저로도 전송 (장전 cron 용)")
     args = parser.parse_args()
-
-    # .env를 확실하게 로드
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    load_dotenv(env_path, override=True)
 
     # 브로커 선택 — .env 의 BROKER 로 활성 증권사 1개 선택(기본 kis). 여러 브로커 키(KIS_*,
     # TOSS_*, KIWOOM_*, SHINHAN_*)를 .env 에 함께 둬도 되고, 없으면 KIS_* 로 폴백한다.
