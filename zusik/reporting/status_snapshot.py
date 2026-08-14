@@ -7,6 +7,7 @@ CLI(--status)와 Rust 웹(/api/status)이 같은 한 소스를 쓴다. effective
 """
 
 import os
+import time
 
 
 def latest_complete_allocation_snapshot(rows) -> dict | None:
@@ -43,6 +44,9 @@ def build_allocation_advice(latest: dict | None, config: dict | None = None) -> 
     row = latest or {}
     cfg = (config or {}).get("cash_deployment", {}) or {}
     kr_cash = max(0, int(row.get("kr_cash", 0) or 0))
+    # 자산 장부의 KR 현금에는 D+2 미정산 금액이 포함될 수 있다. 매수·이체 권고는
+    # 런타임에서 검증한 즉시 주문가능 현금이 있으면 그 금액으로 제한한다.
+    kr_orderable = max(0, int(row.get("kr_orderable_cash", kr_cash) or 0))
     kr_eval = max(0, int(row.get("kr_eval", 0) or 0))
     us_cash = max(0, int(row.get("us_cash_krw", 0) or 0))
     us_eval = max(0, int(row.get("us_eval_krw", 0) or 0))
@@ -50,7 +54,8 @@ def build_allocation_advice(latest: dict | None, config: dict | None = None) -> 
     target_cash_ratio = float(cfg.get(
         "target_cash_ratio", (config or {}).get("_cash_reserve", 0.05)))
     target_us_ratio = float(cfg.get("us_target_allocation", 0.30))
-    total_cash = kr_cash + us_cash
+    book_cash = kr_cash + us_cash
+    total_cash = kr_orderable + us_cash
     target_cash = int(total * target_cash_ratio)
     deployable_cash = max(0, total_cash - target_cash)
     direct_us = us_cash + us_eval
@@ -59,11 +64,14 @@ def build_allocation_advice(latest: dict | None, config: dict | None = None) -> 
     # 달러 예수금도 통합 현금예약의 일부다. 그 잔액을 제외하고 KR에 남겨야 할
     # 최소 원화현금만 보존한 뒤 이체 가능액을 계산한다.
     kr_reserve_needed = max(0, target_cash - us_cash)
-    transferable = max(0, kr_cash - kr_reserve_needed)
+    transferable = max(0, kr_orderable - kr_reserve_needed)
     transfer_krw = min(us_gap, transferable)
     return {
         "total_assets": total,
         "cash_krw": total_cash,
+        "book_cash_krw": book_cash,
+        "kr_orderable_cash_krw": kr_orderable,
+        "us_cash_krw": us_cash,
         "cash_ratio": round(total_cash / total, 4) if total else 0.0,
         "target_cash_ratio": target_cash_ratio,
         "deployable_cash_krw": deployable_cash,
@@ -73,6 +81,26 @@ def build_allocation_advice(latest: dict | None, config: dict | None = None) -> 
         "us_gap_krw": us_gap,
         "recommended_transfer_krw": transfer_krw,
     }
+
+
+def _cached_orderable_kr_cash(bot, max_age_seconds: int = 120) -> int | None:
+    """추가 API 호출 없이 최근 검증된 KR 주문가능 현금을 읽는다.
+
+    상태 파일은 매분 생성되므로 KIS/Toss 클라이언트의 기존 잔고 캐시만 사용한다.
+    검증 실패 또는 오래된 값은 권고에 섞지 않는다.
+    """
+    try:
+        cache = getattr(getattr(bot, "client", None), "_balance_cache", None)
+        if not isinstance(cache, dict) or not isinstance(cache.get("data"), dict):
+            return None
+        if time.time() - float(cache.get("ts", 0) or 0) > max_age_seconds:
+            return None
+        data = cache["data"]
+        if data.get("cash_verified") is False:
+            return 0
+        return max(0, int(data.get("cash", 0) or 0))
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def render_allocation_advice(advice: dict) -> str:
@@ -85,7 +113,9 @@ def render_allocation_advice(advice: dict) -> str:
             f"자금배분 권고: 직접 US 비중 {a.get('direct_us_ratio', 0):.0%} "
             f"(목표 {a.get('target_us_ratio', 0):.0%}). KR 예탁금에서 "
             f"약 {transfer:,}원을 US로 이체하고, 고품질 신호에 분할 투자 "
-            f"(현재 집행 가능 초과현금 {deployable:,}원)."
+            f"(KR 주문가능 {int(a.get('kr_orderable_cash_krw', 0) or 0):,}원, "
+            f"기존 US 예수금 {int(a.get('us_cash_krw', 0) or 0):,}원, "
+            f"집행 가능 초과현금 {deployable:,}원)."
         )
     if deployable >= 100_000:
         return (
@@ -128,9 +158,14 @@ def build_status_snapshot(bot, generated_at: str = "") -> dict:
         snap["equity"] = {}
         snap["by_stock"] = []
 
-    # 1b) 유휴현금과 KR→US 이체 권고 (equity_curve 로컬 데이터만, 주문/API 없음)
+    # 1b) 유휴현금과 KR→US 이체 권고. 자산 버킷은 equity_curve, 집행 한도는
+    # 이미 조회된 client 잔고 캐시를 사용한다(추가 주문/API 없음).
     try:
-        snap["allocation"] = build_allocation_advice(latest, cfg)
+        allocation_row = dict(latest or {})
+        live_orderable_cash = _cached_orderable_kr_cash(bot)
+        if live_orderable_cash is not None:
+            allocation_row["kr_orderable_cash"] = live_orderable_cash
+        snap["allocation"] = build_allocation_advice(allocation_row, cfg)
     except Exception:
         snap["allocation"] = {}
 

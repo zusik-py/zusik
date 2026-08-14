@@ -5666,6 +5666,19 @@ class ReturnStructureRegressionTests(unittest.TestCase):
         cash_after = a["cash_krw"] - a["deployable_cash_krw"]
         self.assertGreaterEqual(cash_after, int(a["total_assets"] * 0.05))
 
+    def test_allocation_advice_caps_transfer_at_verified_orderable_cash(self):
+        from zusik.reporting.status_snapshot import build_allocation_advice
+        a = build_allocation_advice({
+            "kr_cash": 3_000_000, "kr_orderable_cash": 700_000,
+            "kr_eval": 22_000_000,
+            "us_cash_krw": 2_100_000, "us_eval_krw": 5_000_000,
+        }, {"cash_deployment": {"target_cash_ratio": 0.05,
+                                "us_target_allocation": 0.30}})
+        self.assertEqual(a["kr_orderable_cash_krw"], 700_000)
+        self.assertEqual(a["recommended_transfer_krw"], 700_000)
+        self.assertEqual(a["book_cash_krw"], 5_100_000)
+        self.assertEqual(a["cash_krw"], 2_800_000)
+
     def test_allocation_snapshot_skips_incomplete_latest_balance(self):
         from zusik.reporting.status_snapshot import latest_complete_allocation_snapshot
         rows = [
@@ -7116,6 +7129,26 @@ class StatusSnapshotTests(unittest.TestCase):
         self.assertIn("토글", txt)
         self.assertIn("삼성전자", txt)
 
+    def test_allocation_uses_recent_verified_balance_cache(self):
+        import json
+        import time
+        import zusik.storage.portfolio_tracker as pt
+        from zusik.reporting.status_snapshot import build_status_snapshot
+        b = self._bot()
+        with open(pt.EQUITY_CURVE_FILE, "w", encoding="utf-8") as f:
+            json.dump([{
+                "date": "2026-08-14", "kr_cash": 3_000_000,
+                "kr_eval": 22_000_000, "us_cash_krw": 2_100_000,
+                "us_eval_krw": 5_000_000, "total_equity": 32_100_000,
+            }], f)
+        b.client._balance_cache = {
+            "ts": time.time(),
+            "data": {"cash": 712_743, "cash_verified": True},
+        }
+        a = build_status_snapshot(b)["allocation"]
+        self.assertEqual(a["kr_orderable_cash_krw"], 712_743)
+        self.assertLessEqual(a["recommended_transfer_krw"], 712_743)
+
     def test_build_never_raises_on_broken_bot(self):
         import types
         from zusik.reporting.status_snapshot import build_status_snapshot, render_status_text
@@ -8018,6 +8051,7 @@ def run_runtime_unittests():
     suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(ResultsReportTests))
     suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(SellTimingTests))
     suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(SelectionAlphaTests))
+    suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(ReturnStructureRegressionTests))
     suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(UsOpenSessionGuardTests))
     suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(CommandSurfaceTests))
     suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(PnlIntegrityTests))
